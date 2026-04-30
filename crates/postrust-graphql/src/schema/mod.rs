@@ -125,6 +125,8 @@ impl GeneratedSchema {
 pub struct QueryField {
     /// Field name (e.g., "users")
     pub name: String,
+    /// Schema name (e.g., "public", "gold")
+    pub schema_name: String,
     /// Table name
     pub table_name: String,
     /// GraphQL object type name (e.g., "Users")
@@ -166,6 +168,7 @@ impl QueryField {
 
         Self {
             name,
+            schema_name: table.schema.clone(),
             table_name: table.name.clone(),
             type_name: type_name.clone(),
             return_type: format!("[{}!]!", type_name),
@@ -200,6 +203,7 @@ impl QueryField {
 
         Some(Self {
             name: field_name,
+            schema_name: table.schema.clone(),
             table_name: table.name.clone(),
             type_name: type_name.clone(),
             return_type: type_name,
@@ -222,6 +226,7 @@ impl QueryField {
 
         Self {
             name: field_name,
+            schema_name: table.schema.clone(),
             table_name: table.name.clone(),
             type_name: to_pascal_case(&table.name),
             return_type: "Int!".to_string(),
@@ -261,6 +266,8 @@ fn graphql_id_scalar_for_column(col: &Column) -> &'static str {
 pub struct MutationField {
     /// Field name (e.g., "insertUsers")
     pub name: String,
+    /// Schema name (e.g., "public", "gold")
+    pub schema_name: String,
     /// Table name
     pub table_name: String,
     /// Mutation type
@@ -308,6 +315,7 @@ impl MutationField {
         };
         fields.push(Self {
             name,
+            schema_name: table.schema.clone(),
             table_name: table.name.clone(),
             mutation_type: MutationType::Insert,
             return_type: format!("[{}!]!", type_name),
@@ -322,6 +330,7 @@ impl MutationField {
         };
         fields.push(Self {
             name,
+            schema_name: table.schema.clone(),
             table_name: table.name.clone(),
             mutation_type: MutationType::InsertOne,
             return_type: type_name.clone(),
@@ -350,6 +359,7 @@ impl MutationField {
         };
         fields.push(Self {
             name,
+            schema_name: table.schema.clone(),
             table_name: table.name.clone(),
             mutation_type: MutationType::Update,
             return_type: format!("[{}!]!", type_name),
@@ -365,6 +375,7 @@ impl MutationField {
             };
             fields.push(Self {
                 name,
+                schema_name: table.schema.clone(),
                 table_name: table.name.clone(),
                 mutation_type: MutationType::UpdateByPk,
                 return_type: type_name,
@@ -394,6 +405,7 @@ impl MutationField {
         };
         fields.push(Self {
             name,
+            schema_name: table.schema.clone(),
             table_name: table.name.clone(),
             mutation_type: MutationType::Delete,
             return_type: format!("[{}!]!", type_name),
@@ -409,6 +421,7 @@ impl MutationField {
             };
             fields.push(Self {
                 name,
+                schema_name: table.schema.clone(),
                 table_name: table.name.clone(),
                 mutation_type: MutationType::DeleteByPk,
                 return_type: type_name,

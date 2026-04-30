@@ -29,3 +29,5 @@ loadtest
 gen_targets.http
 gen_jwk.json
 gen_private.json
+.env
+run.sh
