@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         let schema_cache_snapshot = state.schema_cache.read().await.clone();
         let schema_cache_arc = Arc::new(schema_cache_snapshot);
         let graphql_config = SchemaConfig {
+            exposed_schemas: config.db_schemas.clone(),
             enable_subscriptions: true,
             ..SchemaConfig::default()
         };

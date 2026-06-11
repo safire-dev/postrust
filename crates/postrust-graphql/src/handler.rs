@@ -309,6 +309,7 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
 
     for field in &generated.query_fields {
         let table_name = field.table_name.clone();
+        let schema_name = field.schema_name.clone();
         let type_name = field.type_name.clone();
         let is_by_pk = field.is_by_pk;
         let is_count = field.is_count;
@@ -318,25 +319,30 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
 
         let mut gql_field = if is_count {
             let table_name_c = table_name.clone();
+            let schema_name_c = schema_name.clone();
             Field::new(&field.name, return_type, move |ctx| {
                 let table_name = table_name_c.clone();
+                let schema_name = schema_name_c.clone();
                 FieldFuture::new(async move {
-                    resolve_count(&ctx, &table_name).await
+                    resolve_count(&ctx, &schema_name, &table_name).await
                 })
             })
         } else {
             let table_name_q = table_name.clone();
+            let schema_name_q = schema_name.clone();
             let type_name_q = type_name.clone();
             let by_pk_id_type_q = by_pk_id_type.clone();
             let by_pk_column_q = by_pk_column.clone();
             Field::new(&field.name, return_type, move |ctx| {
                 let table_name = table_name_q.clone();
+                let schema_name = schema_name_q.clone();
                 let type_name = type_name_q.clone();
                 let by_pk_id_type = by_pk_id_type_q.clone();
                 let by_pk_column = by_pk_column_q.clone();
                 FieldFuture::new(async move {
                     resolve_query(
                         &ctx,
+                        &schema_name,
                         &table_name,
                         &type_name,
                         is_by_pk,
@@ -393,13 +399,15 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
 
     for field in &generated.mutation_fields {
         let table_name = field.table_name.clone();
+        let schema_name = field.schema_name.clone();
         let mutation_type = field.mutation_type;
         let return_type = graphql_type_ref(&field.return_type);
 
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
             let table_name = table_name.clone();
+            let schema_name = schema_name.clone();
             FieldFuture::new(async move {
-                resolve_mutation(&ctx, &table_name, mutation_type).await
+                resolve_mutation(&ctx, &schema_name, &table_name, mutation_type).await
             })
         });
 
@@ -499,6 +507,7 @@ enum ByPkParam {
 /// `SELECT * … WHERE <pk> = $1` with a typed parameter (Int / UUID / String scalars in the schema).
 async fn execute_by_pk_one(
     pool: &PgPool,
+    schema_name: &str,
     table_name: &str,
     pk_col: &str,
     value: ByPkParam,
@@ -506,10 +515,12 @@ async fn execute_by_pk_one(
 ) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     use sqlx::Row;
 
+    let s = postrust_sql::escape_ident(schema_name);
     let t = postrust_sql::escape_ident(table_name);
     let c = postrust_sql::escape_ident(pk_col);
     let sql = format!(
-        "SELECT row_to_json(s) FROM (SELECT * FROM public.{t} WHERE {c} = $1) s",
+        "SELECT row_to_json(s) FROM (SELECT * FROM {s}.{t} WHERE {c} = $1) s",
+        s = s,
         t = t,
         c = c,
     );
@@ -549,6 +560,7 @@ async fn execute_by_pk_one(
 /// Resolve a query field.
 async fn resolve_query<'a>(
     ctx: &ResolverContext<'a>,
+    schema_name: &str,
     table_name: &str,
     _type_name: &str,
     is_by_pk: bool,
@@ -604,7 +616,7 @@ async fn resolve_query<'a>(
                 ByPkParam::String(s)
             }
         };
-        let result = execute_by_pk_one(pool, table_name, pk_col, param, gql_ctx.role()).await?;
+        let result = execute_by_pk_one(pool, schema_name, table_name, pk_col, param, gql_ctx.role()).await?;
         return Ok(result
             .into_iter()
             .next()
@@ -640,7 +652,7 @@ async fn resolve_query<'a>(
                 .collect()
         });
 
-    let (sql, where_values) = build_list_sql(table_name, filter_value.as_ref(), order_by.as_deref(), limit, offset)?;
+    let (sql, where_values) = build_list_sql(schema_name, table_name, filter_value.as_ref(), order_by.as_deref(), limit, offset)?;
 
     let mut conn = pool.acquire().await?;
     sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(gql_ctx.role())))
@@ -667,12 +679,14 @@ async fn resolve_query<'a>(
 }
 /// Build the SQL for a list query with optional filter, ordering, limit, and offset.
 fn build_list_sql(
+    schema_name: &str,
     table_name: &str,
     filter_value: Option<&serde_json::Value>,
     order_by: Option<&[String]>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
+    let s = postrust_sql::escape_ident(schema_name);
     let t = postrust_sql::escape_ident(table_name);
     let (where_sql, where_values) = build_where_clause(filter_value, 1)?;
 
@@ -701,7 +715,9 @@ fn build_list_sql(
     };
 
     let mut sql = format!(
-        "SELECT row_to_json(t) FROM (SELECT * FROM public.{t} {where_sql}{order_sql}) t",
+        "SELECT row_to_json(t) FROM (SELECT * FROM {s}.{t} {where_sql}{order_sql}) t",
+        s = s,
+        t = t,
     );
 
     if let Some(limit) = limit {
@@ -717,6 +733,7 @@ fn build_list_sql(
 /// Resolve a count query field (e.g., usersCount).
 async fn resolve_count<'a>(
     ctx: &ResolverContext<'a>,
+    schema_name: &str,
     table_name: &str,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
     use sqlx::Row;
@@ -735,7 +752,8 @@ async fn resolve_count<'a>(
     let (where_sql, where_values) = build_where_clause(filter_value.as_ref(), 1)?;
 
     let sql = format!(
-        "SELECT COUNT(*) AS cnt FROM public.{} {}",
+        "SELECT COUNT(*) AS cnt FROM {}.{} {}",
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
     );
@@ -762,6 +780,7 @@ async fn resolve_count<'a>(
 /// Resolve a mutation field.
 async fn resolve_mutation<'a>(
     ctx: &ResolverContext<'a>,
+    schema_name: &str,
     table_name: &str,
     mutation_type: MutationType,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
@@ -779,7 +798,7 @@ async fn resolve_mutation<'a>(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::Value::Array(vec![]));
 
-            execute_insert(pool, table_name, gql_ctx.role(), objects, mutation_type).await?
+            execute_insert(pool, schema_name, table_name, gql_ctx.role(), objects, mutation_type).await?
         }
         MutationType::Update | MutationType::UpdateByPk => {
             let set_value = ctx
@@ -795,7 +814,7 @@ async fn resolve_mutation<'a>(
                 .ok()
                 .map(|v| accessor_to_json(&v));
 
-            execute_update(pool, table_name, gql_ctx.role(), set_value, where_clause, mutation_type).await?
+            execute_update(pool, schema_name, table_name, gql_ctx.role(), set_value, where_clause, mutation_type).await?
         }
         MutationType::Delete | MutationType::DeleteByPk => {
             let where_clause = ctx
@@ -804,7 +823,7 @@ async fn resolve_mutation<'a>(
                 .ok()
                 .map(|v| accessor_to_json(&v));
 
-            execute_delete(pool, table_name, gql_ctx.role(), where_clause, mutation_type).await?
+            execute_delete(pool, schema_name, table_name, gql_ctx.role(), where_clause, mutation_type).await?
         }
     };
 
@@ -815,6 +834,7 @@ async fn resolve_mutation<'a>(
 /// Execute an insert mutation.
 async fn execute_insert<'a>(
     pool: &PgPool,
+    schema_name: &str,
     table_name: &str,
     role: &str,
     objects: serde_json::Value,
@@ -851,10 +871,12 @@ async fn execute_insert<'a>(
             let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${}", i)).collect();
 
             let sql = format!(
-                "INSERT INTO public.{} ({}) VALUES ({}) RETURNING row_to_json(public.{}.*)",
+                "INSERT INTO {}.{} ({}) VALUES ({}) RETURNING row_to_json({}.{}.*)",
+                postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
                 columns.iter().map(|c| postrust_sql::escape_ident(c)).collect::<Vec<_>>().join(", "),
                 placeholders.join(", "),
+                postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name)
             );
 
@@ -906,13 +928,21 @@ fn bind_json_value<'q>(
             }
         }
         serde_json::Value::String(s) => {
-            // Try to bind as UUID if the string looks like one, so Postgres
-            // doesn't reject `uuid = text` comparisons.
-            if let Ok(u) = uuid::Uuid::parse_str(s) {
-                query.bind(u)
-            } else {
-                query.bind(s.clone())
-            }
+            // TEMPORARY STOPGAP — always bind as text so PostgreSQL handles
+            // implicit casts. The UUID auto-bind below was added to avoid
+            // `uuid = text` errors on uuid-typed columns, but it breaks
+            // text-typed columns that store UUID-formatted strings (e.g.
+            // demand_demo.time_series_demand.data_center_uid).
+            // TODO: remove this workaround once data_center_uid is migrated
+            // from text -> uuid (blocked by Neon storage capacity).
+            // See Linear: EOS-457
+            query.bind(s.clone())
+            // Original code (restore after migration):
+            // if let Ok(u) = uuid::Uuid::parse_str(s) {
+            //     query.bind(u)
+            // } else {
+            //     query.bind(s.clone())
+            // }
         }
         _ => query.bind(value.to_string()),
     }
@@ -921,6 +951,7 @@ fn bind_json_value<'q>(
 /// Execute an update mutation.
 async fn execute_update<'a>(
     pool: &PgPool,
+    schema_name: &str,
     table_name: &str,
     role: &str,
     set_value: serde_json::Value,
@@ -959,10 +990,12 @@ async fn execute_update<'a>(
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), param_idx)?;
 
     let sql = format!(
-        "UPDATE public.{} SET {} {} RETURNING row_to_json(public.{}.*)",
+        "UPDATE {}.{} SET {} {} RETURNING row_to_json({}.{}.*)",
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         set_parts.join(", "),
         where_sql,
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name)
     );
 
@@ -1003,6 +1036,7 @@ async fn execute_update<'a>(
 /// Execute a delete mutation.
 async fn execute_delete<'a>(
     pool: &PgPool,
+    schema_name: &str,
     table_name: &str,
     role: &str,
     where_clause: Option<serde_json::Value>,
@@ -1023,9 +1057,11 @@ async fn execute_delete<'a>(
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1)?;
 
     let sql = format!(
-        "DELETE FROM public.{} {} RETURNING row_to_json(public.{}.*)",
+        "DELETE FROM {}.{} {} RETURNING row_to_json({}.{}.*)",
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name)
     );
 
