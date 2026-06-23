@@ -958,21 +958,17 @@ fn bind_json_value<'q>(
             }
         }
         serde_json::Value::String(s) => {
-            // TEMPORARY STOPGAP — always bind as text so PostgreSQL handles
-            // implicit casts. The UUID auto-bind below was added to avoid
-            // `uuid = text` errors on uuid-typed columns, but it breaks
-            // text-typed columns that store UUID-formatted strings (e.g.
-            // demand_demo.time_series_demand.data_center_uid).
-            // TODO: remove this workaround once data_center_uid is migrated
-            // from text -> uuid (blocked by Neon storage capacity).
-            // See Linear: EOS-457
-            query.bind(s.clone())
-            // Original code (restore after migration):
-            // if let Ok(u) = uuid::Uuid::parse_str(s) {
-            //     query.bind(u)
-            // } else {
-            //     query.bind(s.clone())
-            // }
+            // Bind UUID-formatted strings as uuid so comparisons against
+            // uuid-typed columns succeed. Notably
+            // demand_demo.time_series_demand.data_center_uid was migrated from
+            // text -> uuid (EOS-457); binding it as text produced
+            // `operator does not exist: uuid = text`. Non-UUID strings still
+            // bind as text.
+            if let Ok(u) = uuid::Uuid::parse_str(s) {
+                query.bind(u)
+            } else {
+                query.bind(s.clone())
+            }
         }
         _ => query.bind(value.to_string()),
     }
