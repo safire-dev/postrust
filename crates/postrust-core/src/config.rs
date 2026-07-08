@@ -125,6 +125,29 @@ pub struct AppConfig {
     /// App-level settings to expose via GUC
     #[serde(default)]
     pub app_settings: HashMap<String, String>,
+
+    // ========================================================================
+    // GraphQL Settings
+    // ========================================================================
+    /// Emit Apollo Federation primitives (`_service`, `_entities`, `@key`) in
+    /// the generated GraphQL schema. On by default; set `PGRST_GRAPHQL_FEDERATION=false`
+    /// to opt out and behave as a plain (non-federated) subgraph. Federation is
+    /// additive — non-federated queries are unaffected when it is enabled.
+    #[serde(default = "default_true")]
+    pub graphql_federation: bool,
+
+    /// Prefix prepended to every generated GraphQL type name so this subgraph's
+    /// types don't collide with another subgraph's in a federated supergraph
+    /// (e.g. `Snowflake` -> `SnowflakeUsers`). `None` = no prefix. Shared
+    /// entities (see [`AppConfig::graphql_shared_entities`]) are exempt.
+    #[serde(default)]
+    pub graphql_type_prefix: Option<String>,
+
+    /// Tables exempt from [`AppConfig::graphql_type_prefix`] — the shared
+    /// federation entities that keep their bare type name so subgraphs can join
+    /// on them by `@key`. Matched by bare table name.
+    #[serde(default)]
+    pub graphql_shared_entities: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -157,6 +180,9 @@ impl Default for AppConfig {
             log_level: LogLevel::Error,
             role_settings: HashMap::new(),
             app_settings: HashMap::new(),
+            graphql_federation: true,
+            graphql_type_prefix: None,
+            graphql_shared_entities: Vec::new(),
         }
     }
 }
@@ -201,6 +227,24 @@ impl AppConfig {
             if let Ok(p) = port.parse() {
                 config.server_port = p;
             }
+        }
+        if let Ok(v) = std::env::var("PGRST_GRAPHQL_FEDERATION") {
+            if let Ok(enabled) = v.trim().parse::<bool>() {
+                config.graphql_federation = enabled;
+            }
+        }
+        if let Ok(prefix) = std::env::var("PGRST_GRAPHQL_TYPE_PREFIX") {
+            let trimmed = prefix.trim();
+            if !trimmed.is_empty() {
+                config.graphql_type_prefix = Some(trimmed.to_string());
+            }
+        }
+        if let Ok(shared) = std::env::var("PGRST_GRAPHQL_SHARED_ENTITIES") {
+            config.graphql_shared_entities = shared
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
 
         config

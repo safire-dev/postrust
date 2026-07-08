@@ -27,6 +27,13 @@ pub struct SchemaConfig {
     pub query_suffix: Option<String>,
     /// Whether to use camelCase for field names
     pub use_camel_case: bool,
+    /// Emit Apollo Federation primitives (`_service`, `_entities`, `@key`).
+    pub enable_federation: bool,
+    /// Prefix applied to generated type names for subgraph namespacing.
+    /// `None`/empty = no prefix. Shared entities are exempt.
+    pub type_prefix: Option<String>,
+    /// Tables exempt from `type_prefix` (shared federation entities).
+    pub shared_entities: Vec<String>,
 }
 
 impl Default for SchemaConfig {
@@ -38,6 +45,9 @@ impl Default for SchemaConfig {
             query_prefix: None,
             query_suffix: None,
             use_camel_case: true,
+            enable_federation: false,
+            type_prefix: None,
+            shared_entities: Vec::new(),
         }
     }
 }
@@ -66,9 +76,55 @@ impl SchemaConfig {
         self
     }
 
+    /// Enable or disable Apollo Federation support.
+    pub fn with_federation(mut self, enable: bool) -> Self {
+        self.enable_federation = enable;
+        self
+    }
+
+    /// Set the federation type-name prefix (subgraph namespacing).
+    pub fn with_type_prefix(mut self, prefix: Option<String>) -> Self {
+        self.type_prefix = prefix.filter(|p| !p.is_empty());
+        self
+    }
+
+    /// Set the tables exempt from the type prefix (shared federation entities).
+    pub fn with_shared_entities(mut self, tables: Vec<String>) -> Self {
+        self.shared_entities = tables;
+        self
+    }
+
     /// Check if a schema is exposed.
     pub fn is_schema_exposed(&self, schema: &str) -> bool {
         self.exposed_schemas.iter().any(|s| s == schema)
+    }
+
+    /// Whether `table_name` is a shared federation entity (exempt from the
+    /// type prefix, so it composes as one entity across subgraphs).
+    pub fn is_shared_entity(&self, table_name: &str) -> bool {
+        self.shared_entities.iter().any(|t| t == table_name)
+    }
+
+    /// GraphQL object type name for a table: PascalCase, prefixed with
+    /// `type_prefix` unless the table is a shared entity.
+    pub fn type_name(&self, table_name: &str) -> String {
+        let base = to_pascal_case(table_name);
+        match &self.type_prefix {
+            Some(prefix) if !prefix.is_empty() && !self.is_shared_entity(table_name) => {
+                format!("{}{}", to_pascal_case(prefix), base)
+            }
+            _ => base,
+        }
+    }
+
+    /// Root Query/Mutation field name with the federation prefix applied. Root
+    /// fields are always namespaced (even for shared entities) so two subgraphs
+    /// never collide on a root field.
+    pub fn root_field_name(&self, base: &str) -> String {
+        match &self.type_prefix {
+            Some(prefix) if !prefix.is_empty() => to_camel_case(&format!("{}_{}", prefix, base)),
+            _ => base.to_string(),
+        }
     }
 }
 
@@ -150,7 +206,7 @@ pub struct QueryField {
 impl QueryField {
     /// Create a list query field (e.g., users).
     pub fn list(table: &Table, config: &SchemaConfig) -> Self {
-        let type_name = to_pascal_case(&table.name);
+        let type_name = config.type_name(&table.name);
         let field_name = if config.use_camel_case {
             to_camel_case(&table.name)
         } else {
@@ -165,6 +221,7 @@ impl QueryField {
             }
             (None, None) => field_name,
         };
+        let name = config.root_field_name(&name);
 
         Self {
             name,
@@ -184,13 +241,14 @@ impl QueryField {
     /// Create a by-PK query field (e.g., userByPk).
     pub fn by_pk(table: &Table, config: &SchemaConfig) -> Option<Self> {
         let first_pk = table.pk_cols.first()?;
-        let type_name = to_pascal_case(&table.name);
+        let type_name = config.type_name(&table.name);
         let singular = singularize(&table.name);
         let field_name = if config.use_camel_case {
             format!("{}ByPk", to_camel_case(&singular))
         } else {
             format!("{}_by_pk", singular)
         };
+        let field_name = config.root_field_name(&field_name);
         let (id_gql, col_name) = table
             .get_column(first_pk)
             .map(|c| {
@@ -223,12 +281,13 @@ impl QueryField {
         } else {
             format!("{}_count", table.name)
         };
+        let field_name = config.root_field_name(&field_name);
 
         Self {
             name: field_name,
             schema_name: table.schema.clone(),
             table_name: table.name.clone(),
-            type_name: to_pascal_case(&table.name),
+            type_name: config.type_name(&table.name),
             return_type: "Int!".to_string(),
             is_list: false,
             is_by_pk: false,
@@ -302,7 +361,7 @@ impl MutationField {
             return vec![];
         }
 
-        let type_name = to_pascal_case(&table.name);
+        let type_name = config.type_name(&table.name);
         let singular = singularize(&table.name);
 
         let mut fields = vec![];
@@ -313,6 +372,7 @@ impl MutationField {
         } else {
             format!("insert_{}", table.name)
         };
+        let name = config.root_field_name(&name);
         fields.push(Self {
             name,
             schema_name: table.schema.clone(),
@@ -328,6 +388,7 @@ impl MutationField {
         } else {
             format!("insert_{}_one", singular)
         };
+        let name = config.root_field_name(&name);
         fields.push(Self {
             name,
             schema_name: table.schema.clone(),
@@ -346,7 +407,7 @@ impl MutationField {
             return vec![];
         }
 
-        let type_name = to_pascal_case(&table.name);
+        let type_name = config.type_name(&table.name);
         let singular = singularize(&table.name);
 
         let mut fields = vec![];
@@ -357,6 +418,7 @@ impl MutationField {
         } else {
             format!("update_{}", table.name)
         };
+        let name = config.root_field_name(&name);
         fields.push(Self {
             name,
             schema_name: table.schema.clone(),
@@ -373,6 +435,7 @@ impl MutationField {
             } else {
                 format!("update_{}_by_pk", singular)
             };
+            let name = config.root_field_name(&name);
             fields.push(Self {
                 name,
                 schema_name: table.schema.clone(),
@@ -392,7 +455,7 @@ impl MutationField {
             return vec![];
         }
 
-        let type_name = to_pascal_case(&table.name);
+        let type_name = config.type_name(&table.name);
         let singular = singularize(&table.name);
 
         let mut fields = vec![];
@@ -403,6 +466,7 @@ impl MutationField {
         } else {
             format!("delete_{}", table.name)
         };
+        let name = config.root_field_name(&name);
         fields.push(Self {
             name,
             schema_name: table.schema.clone(),
@@ -419,6 +483,7 @@ impl MutationField {
             } else {
                 format!("delete_{}_by_pk", singular)
             };
+            let name = config.root_field_name(&name);
             fields.push(Self {
                 name,
                 schema_name: table.schema.clone(),
@@ -447,8 +512,10 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             continue;
         }
 
-        // Create object type
-        let obj_type = TableObjectType::from_table(table);
+        // Create object type. The prefix is applied centrally here (rather than
+        // in `from_table`) so every reference to this type name stays in sync.
+        let mut obj_type = TableObjectType::from_table(table);
+        obj_type.name = config.type_name(&table.name);
         let type_name = obj_type.name.clone();
 
         // Add query fields
@@ -471,7 +538,13 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .map(|relationships| {
                 relationships
                     .iter()
-                    .map(|r| RelationshipField::from_relationship(r))
+                    .map(|r| {
+                        // Keep the related type reference in sync with the
+                        // (possibly prefixed) name of the foreign table's type.
+                        let mut rf = RelationshipField::from_relationship(r);
+                        rf.target_type = config.type_name(&r.foreign_table().name);
+                        rf
+                    })
                     .collect()
             })
             .unwrap_or_default();

@@ -96,6 +96,9 @@ async fn main() -> Result<()> {
         let graphql_config = SchemaConfig {
             exposed_schemas: config.db_schemas.clone(),
             enable_subscriptions: true,
+            enable_federation: config.graphql_federation,
+            type_prefix: config.graphql_type_prefix.clone(),
+            shared_entities: config.graphql_shared_entities.clone(),
             ..SchemaConfig::default()
         };
         let graphql_state = Arc::new(
