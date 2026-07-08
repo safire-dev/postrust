@@ -302,7 +302,7 @@ fn build_dynamic_schema(
     }
 
     // Create query type
-    let query = create_query_type(generated);
+    let query = create_query_type(generated, enable_federation);
 
     // Create mutation type
     let mutation = if !generated.mutation_fields.is_empty() {
@@ -433,7 +433,7 @@ fn create_object_type(obj: &TableObjectType, enable_federation: bool, is_shared:
 }
 
 /// Create the Query type with all table query fields.
-fn create_query_type(generated: &GeneratedSchema) -> Object {
+fn create_query_type(generated: &GeneratedSchema, enable_federation: bool) -> Object {
     let mut query = Object::new("Query");
 
     for field in &generated.query_fields {
@@ -510,14 +510,18 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
     }
 
     // Add introspection queries
-    query = query.field(
-        Field::new("_schema", TypeRef::named("String"), |_| {
-            FieldFuture::new(async move {
-                Ok(Some(Value::String("Postrust GraphQL Schema".to_string())))
-            })
+    let mut schema_field = Field::new("_schema", TypeRef::named("String"), |_| {
+        FieldFuture::new(async move {
+            Ok(Some(Value::String("Postrust GraphQL Schema".to_string())))
         })
-        .description("Schema introspection"),
-    );
+    })
+    .description("Schema introspection");
+    // Emitted identically by every subgraph; mark @shareable so a federated
+    // supergraph composes instead of failing on the duplicate root field.
+    if enable_federation {
+        schema_field = schema_field.shareable();
+    }
+    query = query.field(schema_field);
 
     query
 }
@@ -1830,7 +1834,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let _query = create_query_type(&generated);
+        let _query = create_query_type(&generated, false);
     }
 
     #[test]
