@@ -16,7 +16,7 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use futures::stream::StreamExt;
-use postrust_core::schema_cache::SchemaCache;
+use postrust_core::schema_cache::{Column, SchemaCache};
 use sqlx::PgPool;
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -63,6 +63,7 @@ impl GraphQLState {
             } else {
                 None
             },
+            &config,
         )?;
 
         Ok(Self {
@@ -92,6 +93,7 @@ impl GraphQLState {
             } else {
                 None
             },
+            &self.config,
         )?;
         Ok(())
     }
@@ -190,22 +192,117 @@ pub async fn graphql_playground() -> impl axum::response::IntoResponse {
     ))
 }
 
+/// Everything the federation `_entities` resolver needs to materialise one
+/// entity type: where its rows live and how to interpret its `@key` columns.
+#[derive(Clone)]
+struct EntityInfo {
+    schema_name: String,
+    table_name: String,
+    /// Primary-key columns in `@key` order, with type info for value coercion.
+    key_columns: Vec<Column>,
+}
+
+/// Build the `__typename` -> [`EntityInfo`] map used by `_entities`. Only tables
+/// with a primary key are entities (they are the ones that carry a `@key`); the
+/// map is keyed by the generated (possibly prefixed) GraphQL type name so it
+/// matches the `__typename` in incoming representations.
+fn build_entity_lookup(generated: &GeneratedSchema) -> HashMap<String, EntityInfo> {
+    let mut lookup = HashMap::new();
+    for (type_name, obj) in &generated.object_types {
+        if obj.table.pk_cols.is_empty() {
+            continue;
+        }
+        let key_columns: Vec<Column> = obj
+            .table
+            .pk_cols
+            .iter()
+            .filter_map(|pk| obj.table.get_column(pk).cloned())
+            .collect();
+        // Defensive: skip if a PK column isn't in the column set.
+        if key_columns.len() != obj.table.pk_cols.len() {
+            continue;
+        }
+        lookup.insert(
+            type_name.clone(),
+            EntityInfo {
+                schema_name: obj.table.schema.clone(),
+                table_name: obj.table.name.clone(),
+                key_columns,
+            },
+        );
+    }
+    lookup
+}
+
+/// Resolve the federation `_entities` query: for each representation, fetch the
+/// backing row by its `@key` (honouring RLS via [`begin_request_tx`]) and return
+/// it typed, so the entity's own field resolvers read the columns from the row.
+async fn resolve_entities<'a>(
+    ctx: &ResolverContext<'a>,
+    lookup: &HashMap<String, EntityInfo>,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    let pool = ctx.data::<PgPool>()?;
+    let gql_ctx = ctx.data::<GraphQLContext>()?;
+
+    let representations = ctx.args.try_get("representations")?.list()?;
+    let mut values = Vec::new();
+
+    for repr in representations.iter() {
+        let obj = repr.object()?;
+        let typename = obj.try_get("__typename")?.string()?.to_string();
+
+        let info = lookup.get(&typename).ok_or_else(|| {
+            async_graphql::Error::new(format!("unknown federation entity type `{}`", typename))
+        })?;
+
+        // Assemble the key values in `@key` column order.
+        let mut key = Vec::with_capacity(info.key_columns.len());
+        for col in &info.key_columns {
+            let accessor = obj.try_get(&col.name).map_err(|_| {
+                async_graphql::Error::new(format!(
+                    "entity `{}` representation is missing key field `{}`",
+                    typename, col.name
+                ))
+            })?;
+            let json = accessor_to_json(&accessor);
+            key.push((col.name.clone(), coerce_key_value(col, &json)?));
+        }
+
+        let row = execute_by_key_one(pool, &info.schema_name, &info.table_name, &key, gql_ctx)
+            .await?
+            .into_iter()
+            .next();
+
+        match row {
+            Some(v) => values.push(FieldValue::value(json_to_value(v)).with_type(typename)),
+            // Row absent or hidden by RLS: `_entities` permits a null element.
+            None => values.push(FieldValue::NULL),
+        }
+    }
+
+    Ok(Some(FieldValue::list(values)))
+}
+
 /// Build the dynamic async-graphql schema from our generated schema.
 fn build_dynamic_schema(
     generated: &GeneratedSchema,
     _schema_cache: &SchemaCache,
     subscription_fields: Option<&[SubField]>,
+    config: &SchemaConfig,
 ) -> Result<Schema, GraphQLError> {
+    let enable_federation = config.enable_federation;
+
     // Create object types for each table
     let mut object_types: HashMap<String, Object> = HashMap::new();
 
     for (type_name, obj) in &generated.object_types {
-        let table_obj = create_object_type(obj);
+        let is_shared = config.is_shared_entity(&obj.table.name);
+        let table_obj = create_object_type(obj, enable_federation, is_shared);
         object_types.insert(type_name.clone(), table_obj);
     }
 
     // Create query type
-    let query = create_query_type(generated);
+    let query = create_query_type(generated, enable_federation);
 
     // Create mutation type
     let mutation = if !generated.mutation_fields.is_empty() {
@@ -254,17 +351,40 @@ fn build_dynamic_schema(
     // Register input types
     builder = register_filter_input_types(builder);
 
+    // Emit Apollo Federation primitives (`_service { sdl }`, `_entities`) when
+    // this instance is acting as a federated subgraph.
+    if enable_federation {
+        let entity_lookup = build_entity_lookup(generated);
+        builder = builder.enable_federation().entity_resolver(move |ctx| {
+            // `Fn` may be invoked per request, so clone the (small) lookup in.
+            let entity_lookup = entity_lookup.clone();
+            FieldFuture::new(async move { resolve_entities(&ctx, &entity_lookup).await })
+        });
+    }
+
     builder
         .finish()
         .map_err(|e| GraphQLError::SchemaError(e.to_string()))
 }
 
 /// Create an object type from a TableObjectType.
-fn create_object_type(obj: &TableObjectType) -> Object {
+///
+/// When `enable_federation` is set, tables with a primary key are marked as
+/// federation entities via `@key`. Object field names match column names, so
+/// the key selection is the space-separated list of PK columns (which is also
+/// the Federation representation of a composite key).
+///
+/// `is_shared` marks a table that is federated as the *same* entity across
+/// subgraphs; its non-key fields are emitted as `@shareable`.
+fn create_object_type(obj: &TableObjectType, enable_federation: bool, is_shared: bool) -> Object {
     let mut object = Object::new(&obj.name);
 
     if let Some(desc) = obj.description() {
         object = object.description(desc);
+    }
+
+    if enable_federation && !obj.table.pk_cols.is_empty() {
+        object = object.key(obj.table.pk_cols.join(" "));
     }
 
     for field in &obj.fields {
@@ -297,6 +417,15 @@ fn create_object_type(obj: &TableObjectType) -> Object {
             gql_field
         };
 
+        // A shared entity is resolved by more than one subgraph, so its
+        // non-key fields must be `@shareable` for the supergraph to compose.
+        // Key fields are implicitly shareable, so they're left untouched.
+        let gql_field = if is_shared && !field.is_pk {
+            gql_field.shareable()
+        } else {
+            gql_field
+        };
+
         object = object.field(gql_field);
     }
 
@@ -304,7 +433,7 @@ fn create_object_type(obj: &TableObjectType) -> Object {
 }
 
 /// Create the Query type with all table query fields.
-fn create_query_type(generated: &GeneratedSchema) -> Object {
+fn create_query_type(generated: &GeneratedSchema, enable_federation: bool) -> Object {
     let mut query = Object::new("Query");
 
     for field in &generated.query_fields {
@@ -381,14 +510,18 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
     }
 
     // Add introspection queries
-    query = query.field(
-        Field::new("_schema", TypeRef::named("String"), |_| {
-            FieldFuture::new(async move {
-                Ok(Some(Value::String("Postrust GraphQL Schema".to_string())))
-            })
+    let mut schema_field = Field::new("_schema", TypeRef::named("String"), |_| {
+        FieldFuture::new(async move {
+            Ok(Some(Value::String("Postrust GraphQL Schema".to_string())))
         })
-        .description("Schema introspection"),
-    );
+    })
+    .description("Schema introspection");
+    // Emitted identically by every subgraph; mark @shareable so a federated
+    // supergraph composes instead of failing on the duplicate root field.
+    if enable_federation {
+        schema_field = schema_field.shareable();
+    }
+    query = query.field(schema_field);
 
     query
 }
@@ -543,7 +676,7 @@ async fn begin_request_tx(
     Ok(tx)
 }
 
-/// `SELECT * … WHERE <pk> = $1` with a typed parameter (Int / UUID / String scalars in the schema).
+/// `SELECT * … WHERE <pk> = $1` with a typed parameter (single-column key).
 async fn execute_by_pk_one(
     pool: &PgPool,
     schema_name: &str,
@@ -552,33 +685,56 @@ async fn execute_by_pk_one(
     value: ByPkParam,
     ctx: &GraphQLContext,
 ) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
+    execute_by_key_one(pool, schema_name, table_name, &[(pk_col.to_string(), value)], ctx).await
+}
+
+/// `SELECT * … WHERE c1 = $1 AND c2 = $2 …` for a (possibly composite) key.
+///
+/// Runs inside a per-request transaction so the caller's role and JWT claims —
+/// and therefore RLS — apply to the fetch. This is also the entry point the
+/// federation `_entities` resolver uses to materialise an entity by its `@key`.
+async fn execute_by_key_one(
+    pool: &PgPool,
+    schema_name: &str,
+    table_name: &str,
+    key: &[(String, ByPkParam)],
+    ctx: &GraphQLContext,
+) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     use sqlx::Row;
+
+    if key.is_empty() {
+        return Err(async_graphql::Error::new(
+            "cannot fetch a row without any key columns",
+        ));
+    }
 
     let s = postrust_sql::escape_ident(schema_name);
     let t = postrust_sql::escape_ident(table_name);
-    let c = postrust_sql::escape_ident(pk_col);
-    let sql = format!(
-        "SELECT row_to_json(s) FROM (SELECT * FROM {s}.{t} WHERE {c} = $1) s",
-        s = s,
-        t = t,
-        c = c,
-    );
+    let where_sql = key
+        .iter()
+        .enumerate()
+        .map(|(i, (col, _))| format!("{} = ${}", postrust_sql::escape_ident(col), i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("SELECT row_to_json(s) FROM (SELECT * FROM {s}.{t} WHERE {where_sql}) s");
 
-    trace!("Executing by-PK SQL: {}, role={}", sql, ctx.role());
+    trace!("Executing by-key SQL: {}, role={}", sql, ctx.role());
 
     let mut tx = begin_request_tx(pool, ctx).await?;
 
-    let rows = match value {
-        ByPkParam::I64(n) => sqlx::query(&sql).bind(n).fetch_all(&mut *tx).await,
-        ByPkParam::Uuid(u) => sqlx::query(&sql).bind(u).fetch_all(&mut *tx).await,
-        ByPkParam::String(ref s) => {
-            sqlx::query(&sql)
-                .bind(s)
-                .fetch_all(&mut *tx)
-                .await
-        }
+    let mut query = sqlx::query(&sql);
+    for (_, param) in key {
+        query = match param {
+            ByPkParam::I64(n) => query.bind(*n),
+            ByPkParam::Uuid(u) => query.bind(*u),
+            ByPkParam::String(s) => query.bind(s.clone()),
+        };
     }
-    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+    let rows = query
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
     let results: Vec<serde_json::Value> = rows
         .iter()
@@ -590,6 +746,60 @@ async fn execute_by_pk_one(
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
     Ok(results)
+}
+
+/// Coerce a federation representation value into a typed key parameter based on
+/// the column's Postgres type (mirrors the by-PK `id` coercion).
+fn coerce_key_value(
+    col: &Column,
+    value: &serde_json::Value,
+) -> Result<ByPkParam, async_graphql::Error> {
+    let dt = col.data_type.to_lowercase();
+    let nt = col.nominal_type.to_lowercase();
+
+    if dt == "integer" || dt == "int4" || dt == "smallint" || dt == "int2" {
+        let n = value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|u| i64::try_from(u).ok()))
+            .ok_or_else(|| {
+                async_graphql::Error::new(format!("entity key `{}` must be an integer", col.name))
+            })?;
+        Ok(ByPkParam::I64(n))
+    } else if dt == "bigint" || dt == "int8" || nt == "int8" {
+        // `BigInt` is a custom scalar that may arrive as a JSON number or a
+        // numeric string; either way it must bind as int8, not text, or the
+        // `WHERE bigint_col = $n` comparison fails to type-check in Postgres.
+        let n = value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|u| i64::try_from(u).ok()))
+            .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .ok_or_else(|| {
+                async_graphql::Error::new(format!("entity key `{}` must be a bigint", col.name))
+            })?;
+        Ok(ByPkParam::I64(n))
+    } else if dt == "uuid" || nt == "uuid" {
+        let s = value.as_str().ok_or_else(|| {
+            async_graphql::Error::new(format!("entity key `{}` must be a UUID string", col.name))
+        })?;
+        let u = Uuid::parse_str(s).map_err(|e| {
+            async_graphql::Error::new(format!("entity key `{}` is not a valid UUID: {e}", col.name))
+        })?;
+        Ok(ByPkParam::Uuid(u))
+    } else {
+        let s = if let Some(s) = value.as_str() {
+            s.to_string()
+        } else if let Some(n) = value.as_i64() {
+            n.to_string()
+        } else if let Some(n) = value.as_u64() {
+            n.to_string()
+        } else {
+            return Err(async_graphql::Error::new(format!(
+                "entity key `{}` value could not be interpreted",
+                col.name
+            )));
+        };
+        Ok(ByPkParam::String(s))
+    }
 }
 
 /// Resolve a query field.
@@ -1604,7 +1814,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let result = build_dynamic_schema(&generated, &cache, None);
+        let result = build_dynamic_schema(&generated, &cache, None, &config);
         if let Err(ref e) = result {
             eprintln!("Schema build error: {:?}", e);
         }
@@ -1624,7 +1834,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let _query = create_query_type(&generated);
+        let _query = create_query_type(&generated, false);
     }
 
     #[test]
@@ -1691,7 +1901,7 @@ mod tests {
         assert!(!sub_fields.is_empty(), "Should have subscription fields");
 
         // Build schema with subscriptions
-        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields));
+        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields), &config);
         assert!(result.is_ok(), "Schema with subscriptions should build");
     }
 
