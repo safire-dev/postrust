@@ -16,7 +16,8 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use futures::stream::StreamExt;
-use postrust_core::schema_cache::{Column, SchemaCache};
+use postrust_core::{Column, QualifiedIdentifier, SchemaCache, Table};
+use sqlx::types::{BigDecimal, Json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -898,13 +899,11 @@ async fn resolve_query<'a>(
         });
 
     let (sql, where_values) = build_list_sql(schema_name, table_name, filter_value.as_ref(), order_by.as_deref(), limit, offset)?;
+    let table = table_metadata(gql_ctx, schema_name, table_name).await?;
 
     let mut tx = begin_request_tx(pool, gql_ctx).await?;
 
-    let mut query = sqlx::query(&sql);
-    for val in &where_values {
-        query = bind_json_value(query, val);
-    }
+    let query = bind_table_values(&sql, &table, &where_values)?;
 
     let result: Vec<serde_json::Value> = {
         use sqlx::Row;
@@ -930,7 +929,7 @@ fn build_list_sql(
     order_by: Option<&[String]>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
+) -> Result<(String, Vec<BoundValue>), async_graphql::Error> {
     let s = postrust_sql::escape_ident(schema_name);
     let t = postrust_sql::escape_ident(table_name);
     let (where_sql, where_values) = build_where_clause(filter_value, 1)?;
@@ -1005,12 +1004,10 @@ async fn resolve_count<'a>(
 
     trace!("Executing COUNT SQL: {}", sql);
 
+    let table = table_metadata(gql_ctx, schema_name, table_name).await?;
     let mut tx = begin_request_tx(pool, gql_ctx).await?;
 
-    let mut query = sqlx::query(&sql);
-    for val in &where_values {
-        query = bind_json_value(query, val);
-    }
+    let query = bind_table_values(&sql, &table, &where_values)?;
 
     let row = query.fetch_one(&mut *tx).await?;
     let count: i64 = row.try_get("cnt")?;
@@ -1098,6 +1095,7 @@ async fn execute_insert<'a>(
         return Err(async_graphql::Error::new("objects cannot be empty"));
     }
 
+    let table = table_metadata(ctx, schema_name, table_name).await?;
     let mut tx = begin_request_tx(pool, ctx).await?;
 
     let mut inserted: Vec<FieldValue> = Vec::new();
@@ -1120,13 +1118,14 @@ async fn execute_insert<'a>(
 
             trace!("Executing INSERT SQL: {}", sql);
 
-            // Build query with parameters
-            let mut query = sqlx::query(&sql);
-            for col in &columns {
-                if let Some(val) = map.get(*col) {
-                    query = bind_json_value(query, val);
-                }
-            }
+            let values: Vec<BoundValue> = columns
+                .iter()
+                .map(|column| BoundValue {
+                    column_name: (*column).to_string(),
+                    value: map[*column].clone(),
+                })
+                .collect();
+            let query = bind_table_values(&sql, &table, &values)?;
 
             let row = query.fetch_one(&mut *tx).await?;
             if let Ok(json_val) = row.try_get::<serde_json::Value, _>(0) {
@@ -1148,6 +1147,221 @@ async fn execute_insert<'a>(
             Ok(Some(FieldValue::list(inserted)))
         }
     }
+}
+
+async fn table_metadata(
+    ctx: &GraphQLContext,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Table, async_graphql::Error> {
+    let cache = ctx
+        .schema_cache
+        .get()
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+    let identifier = QualifiedIdentifier::new(schema_name, table_name);
+    cache
+        .as_ref()
+        .and_then(|cache| cache.get_table(&identifier))
+        .cloned()
+        .ok_or_else(|| {
+            async_graphql::Error::new(format!(
+                "table `{schema_name}.{table_name}` is missing from the schema cache"
+            ))
+        })
+}
+
+enum TypedColumnValue {
+    I16(Option<i16>),
+    I32(Option<i32>),
+    I64(Option<i64>),
+    F32(Option<f32>),
+    F64(Option<f64>),
+    Numeric(Option<BigDecimal>),
+    Bool(Option<bool>),
+    Uuid(Option<Uuid>),
+    String(Option<String>),
+    Json(Option<Json<serde_json::Value>>),
+}
+
+#[derive(Clone, Debug)]
+struct BoundValue {
+    column_name: String,
+    value: serde_json::Value,
+}
+
+#[cfg(test)]
+impl PartialEq<serde_json::Value> for BoundValue {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        self.value == *other
+    }
+}
+
+fn bind_table_values<'q>(
+    sql: &'q str,
+    table: &Table,
+    values: &[BoundValue],
+) -> Result<
+    sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    async_graphql::Error,
+> {
+    let columns: Vec<&Column> = values
+        .iter()
+        .map(|value| {
+            table.get_column(&value.column_name).ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "column `{}` does not exist on {}.{}",
+                    value.column_name, table.schema, table.name
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let bindings: Vec<Option<TypedColumnValue>> = columns
+        .iter()
+        .zip(values)
+        .map(|(column, value)| coerce_column_value(column, &value.value))
+        .collect::<Result<_, _>>()?;
+
+    let mut query = if bindings.iter().all(Option::is_some) {
+        sqlx::query(sql)
+    } else {
+        dynamic_json_query(sql)
+    };
+
+    for ((column, value), binding) in columns.iter().zip(values).zip(bindings) {
+        query = match binding {
+            Some(binding) => bind_typed_column_value(query, binding),
+            None => {
+                debug!(
+                    "No typed GraphQL binding for PostgreSQL type `{}` on column `{}.{}`; disabling statement persistence",
+                    column.data_type,
+                    table.name,
+                    column.name,
+                );
+                bind_json_value(query, &value.value)
+            }
+        };
+    }
+
+    Ok(query)
+}
+
+fn coerce_column_value(
+    column: &Column,
+    value: &serde_json::Value,
+) -> Result<Option<TypedColumnValue>, async_graphql::Error> {
+    let type_name = column.data_type.to_ascii_lowercase();
+    let invalid = || {
+        async_graphql::Error::new(format!(
+            "value `{value}` is not valid for column `{}` of PostgreSQL type `{}`",
+            column.name, column.data_type
+        ))
+    };
+
+    if value.is_null() {
+        if !column.nullable {
+            return Err(async_graphql::Error::new(format!(
+                "column `{}` does not accept null",
+                column.name
+            )));
+        }
+        return Ok(match type_name.as_str() {
+            "smallint" | "int2" => Some(TypedColumnValue::I16(None)),
+            "integer" | "int" | "int4" => Some(TypedColumnValue::I32(None)),
+            "bigint" | "int8" => Some(TypedColumnValue::I64(None)),
+            "real" | "float4" => Some(TypedColumnValue::F32(None)),
+            "double precision" | "float8" => Some(TypedColumnValue::F64(None)),
+            "numeric" | "decimal" => Some(TypedColumnValue::Numeric(None)),
+            "boolean" | "bool" => Some(TypedColumnValue::Bool(None)),
+            "uuid" => Some(TypedColumnValue::Uuid(None)),
+            "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" => {
+                Some(TypedColumnValue::String(None))
+            }
+            "json" | "jsonb" => Some(TypedColumnValue::Json(None)),
+            _ => None,
+        });
+    }
+
+    let binding = match type_name.as_str() {
+        "smallint" | "int2" => TypedColumnValue::I16(Some(
+            value
+                .as_i64()
+                .and_then(|value| i16::try_from(value).ok())
+                .ok_or_else(invalid)?,
+        )),
+        "integer" | "int" | "int4" => TypedColumnValue::I32(Some(
+            value
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(invalid)?,
+        )),
+        "bigint" | "int8" => {
+            TypedColumnValue::I64(Some(value.as_i64().ok_or_else(invalid)?))
+        }
+        "real" | "float4" => {
+            TypedColumnValue::F32(Some(value.as_f64().ok_or_else(invalid)? as f32))
+        }
+        "double precision" | "float8" => {
+            TypedColumnValue::F64(Some(value.as_f64().ok_or_else(invalid)?))
+        }
+        "numeric" | "decimal" => TypedColumnValue::Numeric(Some(
+            value
+                .as_number()
+                .ok_or_else(invalid)?
+                .to_string()
+                .parse::<BigDecimal>()
+                .map_err(|_| invalid())?,
+        )),
+        "boolean" | "bool" => {
+            TypedColumnValue::Bool(Some(value.as_bool().ok_or_else(invalid)?))
+        }
+        "uuid" => TypedColumnValue::Uuid(Some(
+            value
+                .as_str()
+                .ok_or_else(invalid)?
+                .parse::<Uuid>()
+                .map_err(|_| invalid())?,
+        )),
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" => {
+            TypedColumnValue::String(Some(
+                value.as_str().ok_or_else(invalid)?.to_string(),
+            ))
+        }
+        "json" | "jsonb" => TypedColumnValue::Json(Some(Json(value.clone()))),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(binding))
+}
+
+fn bind_typed_column_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    value: TypedColumnValue,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match value {
+        TypedColumnValue::I16(value) => query.bind(value),
+        TypedColumnValue::I32(value) => query.bind(value),
+        TypedColumnValue::I64(value) => query.bind(value),
+        TypedColumnValue::F32(value) => query.bind(value),
+        TypedColumnValue::F64(value) => query.bind(value),
+        TypedColumnValue::Numeric(value) => query.bind(value),
+        TypedColumnValue::Bool(value) => query.bind(value),
+        TypedColumnValue::Uuid(value) => query.bind(value),
+        TypedColumnValue::String(value) => query.bind(value),
+        TypedColumnValue::Json(value) => query.bind(value),
+    }
+}
+
+/// Build a query whose parameter types are selected dynamically from JSON values.
+///
+/// These statements cannot safely be persisted because SQLx caches them by SQL
+/// text while PostgreSQL fixes each parameter's type when the statement is first
+/// prepared. A later JSON value may select a different Rust/PostgreSQL type for
+/// the same placeholder.
+fn dynamic_json_query<'q>(
+    sql: &'q str,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    sqlx::query(sql).persistent(false)
 }
 
 /// Bind a JSON value to a sqlx query.
@@ -1207,6 +1421,7 @@ async fn execute_update<'a>(
         return Err(async_graphql::Error::new("set cannot be empty"));
     }
 
+    let table = table_metadata(ctx, schema_name, table_name).await?;
     let mut tx = begin_request_tx(pool, ctx).await?;
 
     // Build SET clause
@@ -1232,18 +1447,12 @@ async fn execute_update<'a>(
 
     trace!("Executing UPDATE SQL: {}", sql);
 
-    // Build query with parameters
-    let mut query = sqlx::query(&sql);
-
-    // Bind SET values
-    for val in set_map.values() {
-        query = bind_json_value(query, val);
-    }
-
-    // Bind WHERE values
-    for val in &where_values {
-        query = bind_json_value(query, val);
-    }
+    let mut values: Vec<BoundValue> = set_map
+        .into_iter()
+        .map(|(column_name, value)| BoundValue { column_name, value })
+        .collect();
+    values.extend(where_values);
+    let query = bind_table_values(&sql, &table, &values)?;
 
     let rows = query.fetch_all(&mut *tx).await?;
 
@@ -1295,13 +1504,8 @@ async fn execute_delete<'a>(
 
     trace!("Executing DELETE SQL: {}", sql);
 
-    // Build query with parameters
-    let mut query = sqlx::query(&sql);
-
-    // Bind WHERE values
-    for val in &where_values {
-        query = bind_json_value(query, val);
-    }
+    let table = table_metadata(ctx, schema_name, table_name).await?;
+    let query = bind_table_values(&sql, &table, &where_values)?;
 
     let rows = query.fetch_all(&mut *tx).await?;
 
@@ -1328,9 +1532,9 @@ async fn execute_delete<'a>(
 fn build_where_clause(
     where_value: Option<&serde_json::Value>,
     start_param_idx: usize,
-) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
+) -> Result<(String, Vec<BoundValue>), async_graphql::Error> {
     let mut conditions: Vec<String> = Vec::new();
-    let mut values: Vec<serde_json::Value> = Vec::new();
+    let mut values: Vec<BoundValue> = Vec::new();
     let mut param_idx = start_param_idx;
 
     if let Some(serde_json::Value::Object(map)) = where_value {
@@ -1348,7 +1552,10 @@ fn build_where_clause(
                                         let col = postrust_sql::escape_ident(key);
                                         let parts: Vec<String> = arr.iter().map(|v| {
                                             let placeholder = format!("${}", param_idx);
-                                            values.push(v.clone());
+                                            values.push(BoundValue {
+                                                column_name: key.clone(),
+                                                value: v.clone(),
+                                            });
                                             param_idx += 1;
                                             format!("{} = {}", col, placeholder)
                                         }).collect();
@@ -1380,7 +1587,10 @@ fn build_where_clause(
                                     _ => continue,
                                 };
                                 conditions.push(condition);
-                                values.push(op_val.clone());
+                                values.push(BoundValue {
+                                    column_name: key.clone(),
+                                    value: op_val.clone(),
+                                });
                                 param_idx += 1;
                             }
                         }
@@ -1389,7 +1599,10 @@ fn build_where_clause(
                 _ => {
                     // Direct equality: {field: value}
                     conditions.push(format!("{} = ${}", postrust_sql::escape_ident(key), param_idx));
-                    values.push(val.clone());
+                    values.push(BoundValue {
+                        column_name: key.clone(),
+                        value: val.clone(),
+                    });
                     param_idx += 1;
                 }
             }
@@ -1680,6 +1893,45 @@ mod tests {
         }
     }
 
+    fn column_with_type(data_type: &str, nullable: bool) -> Column {
+        Column {
+            name: "value".into(),
+            description: None,
+            nullable,
+            data_type: data_type.into(),
+            nominal_type: data_type.into(),
+            max_len: None,
+            default: None,
+            enum_values: vec![],
+            is_pk: false,
+            position: 1,
+        }
+    }
+
+    #[test]
+    fn test_integer_json_value_uses_float_binding_for_float_column() {
+        let column = column_with_type("double precision", false);
+        let binding = coerce_column_value(&column, &serde_json::json!(12)).unwrap();
+
+        assert!(matches!(binding, Some(TypedColumnValue::F64(Some(12.0)))));
+    }
+
+    #[test]
+    fn test_fractional_json_value_is_rejected_for_integer_column() {
+        let column = column_with_type("bigint", false);
+        let result = coerce_column_value(&column, &serde_json::json!(12.5));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_uses_column_specific_float_binding() {
+        let column = column_with_type("double precision", true);
+        let binding = coerce_column_value(&column, &serde_json::Value::Null).unwrap();
+
+        assert!(matches!(binding, Some(TypedColumnValue::F64(None))));
+    }
+
     // ============================================================================
     // Type Reference Tests
     // ============================================================================
@@ -1939,17 +2191,18 @@ mod tests {
 
     #[test]
     fn test_build_list_sql_no_args() {
-        let (sql, values) = build_list_sql("users", None, None, None, None).unwrap();
+        let (sql, values) = build_list_sql("public", "users", None, None, None, None).unwrap();
         assert_eq!(
             sql,
-            r#"SELECT row_to_json(t) FROM (SELECT * FROM public."users" ) t"#
+            r#"SELECT row_to_json(t) FROM (SELECT * FROM "public"."users" ) t"#
         );
         assert!(values.is_empty());
     }
 
     #[test]
     fn test_build_list_sql_with_limit_and_offset() {
-        let (sql, values) = build_list_sql("users", None, None, Some(10), Some(20)).unwrap();
+        let (sql, values) =
+            build_list_sql("public", "users", None, None, Some(10), Some(20)).unwrap();
         assert!(sql.contains("LIMIT 10"));
         assert!(sql.contains("OFFSET 20"));
         assert!(values.is_empty());
@@ -1958,7 +2211,8 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_order_by_asc() {
         let order = vec!["name_ASC".to_string()];
-        let (sql, _) = build_list_sql("users", None, Some(&order), None, None).unwrap();
+        let (sql, _) =
+            build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
         assert!(
             sql.contains(r#"ORDER BY "name" ASC"#),
             "Expected ORDER BY clause in SQL: {}",
@@ -1969,7 +2223,8 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_order_by_desc() {
         let order = vec!["createdAt_DESC".to_string()];
-        let (sql, _) = build_list_sql("users", None, Some(&order), None, None).unwrap();
+        let (sql, _) =
+            build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
         assert!(
             sql.contains(r#"ORDER BY "createdAt" DESC"#),
             "Expected ORDER BY clause in SQL: {}",
@@ -1980,7 +2235,8 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_multiple_order_by() {
         let order = vec!["name_ASC".to_string(), "id_DESC".to_string()];
-        let (sql, _) = build_list_sql("users", None, Some(&order), None, None).unwrap();
+        let (sql, _) =
+            build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
         assert!(
             sql.contains(r#"ORDER BY "name" ASC, "id" DESC"#),
             "Expected multi-column ORDER BY in SQL: {}",
@@ -1991,7 +2247,8 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_filter_eq() {
         let filter = serde_json::json!({ "status": { "eq": "active" } });
-        let (sql, values) = build_list_sql("users", Some(&filter), None, None, None).unwrap();
+        let (sql, values) =
+            build_list_sql("public", "users", Some(&filter), None, None, None).unwrap();
         assert!(
             sql.contains("WHERE"),
             "Expected WHERE clause in SQL: {}",
@@ -2009,7 +2266,8 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_filter_in() {
         let filter = serde_json::json!({ "role": { "in": ["admin", "editor"] } });
-        let (sql, values) = build_list_sql("users", Some(&filter), None, None, None).unwrap();
+        let (sql, values) =
+            build_list_sql("public", "users", Some(&filter), None, None, None).unwrap();
         assert!(
             sql.contains("WHERE"),
             "Expected WHERE clause in SQL: {}",
@@ -2025,6 +2283,7 @@ mod tests {
         let filter = serde_json::json!({ "status": { "eq": "active" } });
         let order = vec!["name_ASC".to_string()];
         let (sql, values) = build_list_sql(
+            "public",
             "users",
             Some(&filter),
             Some(&order),
@@ -2041,9 +2300,10 @@ mod tests {
 
     #[test]
     fn test_build_list_sql_escapes_table_name() {
-        let (sql, _) = build_list_sql("user accounts", None, None, None, None).unwrap();
+        let (sql, _) =
+            build_list_sql("public", "user accounts", None, None, None, None).unwrap();
         assert!(
-            sql.contains(r#"public."user accounts""#),
+            sql.contains(r#""public"."user accounts""#),
             "Table name not escaped: {}",
             sql
         );
