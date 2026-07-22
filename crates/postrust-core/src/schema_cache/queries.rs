@@ -1,8 +1,8 @@
 //! SQL queries for schema introspection.
 
-use super::table::{Column, ColumnMap, Table, TablesMap};
 use super::relationship::{Cardinality, Relationship, RelationshipsMap};
 use super::routine::{FuncVolatility, RetType, Routine, RoutineMap};
+use super::table::{Column, ColumnMap, Table, TablesMap};
 use crate::api_request::QualifiedIdentifier;
 use crate::error::{Error, Result};
 use indexmap::IndexMap;
@@ -187,7 +187,9 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
                 SELECT 1 FROM pg_index i
                 WHERE i.indrelid = c.conrelid
                   AND i.indisunique
+                  AND i.indnkeyatts = cardinality(c.conkey)
                   AND i.indkey::int[] @> c.conkey::int[]
+                  AND i.indkey::int[] <@ c.conkey::int[]
             ) as is_unique
         FROM pg_constraint c
         JOIN pg_class t1 ON t1.oid = c.conrelid
@@ -219,81 +221,110 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
         let foreign_is_view: bool = row.get("foreign_table_is_view");
         let is_unique: bool = row.get("is_unique");
 
-        let table_qi = QualifiedIdentifier::new(&table_schema, &table_name);
-        let foreign_qi = QualifiedIdentifier::new(&foreign_schema, &foreign_name);
-
         let column_pairs: Vec<(String, String)> = columns
             .into_iter()
             .zip(foreign_columns.into_iter())
             .collect();
 
-        let is_self = table_qi == foreign_qi;
-
-        // M2O relationship (this table has FK to foreign table)
-        let cardinality = if is_unique {
-            Cardinality::O2O {
-                constraint: constraint_name.clone(),
-                columns: column_pairs.clone(),
-                is_parent: false,
-            }
-        } else {
-            Cardinality::M2O {
-                constraint: constraint_name.clone(),
-                columns: column_pairs.clone(),
-            }
-        };
-
-        let rel = Relationship::ForeignKey {
-            table: table_qi.clone(),
-            foreign_table: foreign_qi.clone(),
-            is_self,
-            cardinality,
-            table_is_view,
-            foreign_table_is_view: foreign_is_view,
-            constraint_name: constraint_name.clone(),
-        };
-
-        relationships
-            .entry((table_qi.clone(), table_schema.clone()))
-            .or_default()
-            .push(rel);
-
-        // O2M relationship (foreign table has many of this table)
-        let reverse_columns: Vec<(String, String)> = column_pairs
-            .iter()
-            .map(|(a, b)| (b.clone(), a.clone()))
-            .collect();
-
-        let reverse_cardinality = if is_unique {
-            Cardinality::O2O {
-                constraint: constraint_name.clone(),
-                columns: reverse_columns,
-                is_parent: true,
-            }
-        } else {
-            Cardinality::O2M {
-                constraint: constraint_name.clone(),
-                columns: column_pairs,
-            }
-        };
-
-        let reverse_rel = Relationship::ForeignKey {
-            table: foreign_qi.clone(),
-            foreign_table: table_qi,
-            is_self,
-            cardinality: reverse_cardinality,
-            table_is_view: foreign_is_view,
-            foreign_table_is_view: table_is_view,
-            constraint_name,
-        };
-
-        relationships
-            .entry((foreign_qi, foreign_schema))
-            .or_default()
-            .push(reverse_rel);
+        add_fk_relationships(
+            &mut relationships,
+            FkRelationshipInput {
+                table_schema,
+                table_name,
+                foreign_schema,
+                foreign_name,
+                constraint_name,
+                column_pairs,
+                table_is_view,
+                foreign_is_view,
+                is_unique,
+            },
+        );
     }
 
     Ok(relationships)
+}
+
+struct FkRelationshipInput {
+    table_schema: String,
+    table_name: String,
+    foreign_schema: String,
+    foreign_name: String,
+    constraint_name: String,
+    column_pairs: Vec<(String, String)>,
+    table_is_view: bool,
+    foreign_is_view: bool,
+    is_unique: bool,
+}
+
+fn add_fk_relationships(relationships: &mut RelationshipsMap, input: FkRelationshipInput) {
+    let table_qi = QualifiedIdentifier::new(&input.table_schema, &input.table_name);
+    let foreign_qi = QualifiedIdentifier::new(&input.foreign_schema, &input.foreign_name);
+    let is_self = table_qi == foreign_qi;
+
+    // M2O relationship (this table has FK to foreign table)
+    let cardinality = if input.is_unique {
+        Cardinality::O2O {
+            constraint: input.constraint_name.clone(),
+            columns: input.column_pairs.clone(),
+            is_parent: false,
+        }
+    } else {
+        Cardinality::M2O {
+            constraint: input.constraint_name.clone(),
+            columns: input.column_pairs.clone(),
+        }
+    };
+
+    let rel = Relationship::ForeignKey {
+        table: table_qi.clone(),
+        foreign_table: foreign_qi.clone(),
+        is_self,
+        cardinality,
+        table_is_view: input.table_is_view,
+        foreign_table_is_view: input.foreign_is_view,
+        constraint_name: input.constraint_name.clone(),
+    };
+
+    relationships
+        .entry((table_qi.clone(), input.table_schema.clone()))
+        .or_default()
+        .push(rel);
+
+    // O2M relationship (foreign table has many of this table)
+    let reverse_columns: Vec<(String, String)> = input
+        .column_pairs
+        .iter()
+        .map(|(a, b)| (b.clone(), a.clone()))
+        .collect();
+
+    let reverse_cardinality = if input.is_unique {
+        Cardinality::O2O {
+            constraint: input.constraint_name.clone(),
+            columns: reverse_columns,
+            is_parent: true,
+        }
+    } else {
+        Cardinality::O2M {
+            constraint: input.constraint_name.clone(),
+            columns: reverse_columns,
+        }
+    };
+
+    let reverse_rel = Relationship::ForeignKey {
+        table: foreign_qi.clone(),
+        foreign_table: table_qi,
+        is_self,
+        cardinality: reverse_cardinality,
+        table_is_view: input.foreign_is_view,
+        foreign_table_is_view: input.table_is_view,
+        constraint_name: input.constraint_name,
+    };
+
+    relationships
+        .entry((foreign_qi, input.foreign_schema))
+        .or_default()
+        .push(reverse_rel);
 }
 
 /// Load stored functions.
