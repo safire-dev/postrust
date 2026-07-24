@@ -6,6 +6,7 @@
 use crate::context::GraphQLContext;
 use crate::error::GraphQLError;
 use crate::schema::object::TableObjectType;
+use crate::schema::relationship::RelationshipField;
 use crate::schema::{build_schema, GeneratedSchema, MutationType, SchemaConfig};
 use crate::subscription::{
     generate_subscription_fields, NotifyBroker, SubscriptionField as SubField, TableChangePayload,
@@ -16,7 +17,8 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use futures::stream::StreamExt;
-use postrust_core::{Column, QualifiedIdentifier, SchemaCache, Table};
+use postrust_core::schema_cache::Cardinality;
+use postrust_core::{Column, QualifiedIdentifier, Relationship, SchemaCache, Table};
 use sqlx::types::{BigDecimal, Json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -298,7 +300,11 @@ fn build_dynamic_schema(
 
     for (type_name, obj) in &generated.object_types {
         let is_shared = config.is_shared_entity(&obj.table.name);
-        let table_obj = create_object_type(obj, enable_federation, is_shared);
+        let relationship_fields = generated
+            .get_relationship_fields(type_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let table_obj = create_object_type(obj, relationship_fields, enable_federation, is_shared);
         object_types.insert(type_name.clone(), table_obj);
     }
 
@@ -377,7 +383,12 @@ fn build_dynamic_schema(
 ///
 /// `is_shared` marks a table that is federated as the *same* entity across
 /// subgraphs; its non-key fields are emitted as `@shareable`.
-fn create_object_type(obj: &TableObjectType, enable_federation: bool, is_shared: bool) -> Object {
+fn create_object_type(
+    obj: &TableObjectType,
+    relationship_fields: &[RelationshipField],
+    enable_federation: bool,
+    is_shared: bool,
+) -> Object {
     let mut object = Object::new(&obj.name);
 
     if let Some(desc) = obj.description() {
@@ -430,7 +441,134 @@ fn create_object_type(obj: &TableObjectType, enable_federation: bool, is_shared:
         object = object.field(gql_field);
     }
 
+    for relationship in relationship_fields {
+        if obj.has_field(&relationship.name) {
+            continue;
+        }
+
+        let field_name = relationship.name.clone();
+        let field_description = relationship.description.clone();
+        let field_type = graphql_type_ref(&relationship.type_string());
+        let relationship_for_resolver = relationship.clone();
+        let gql_field = Field::new(&field_name, field_type, move |ctx| {
+            let relationship = relationship_for_resolver.clone();
+            FieldFuture::new(async move {
+                resolve_relationship_field(&ctx, &relationship).await
+            })
+        });
+
+        let gql_field = if let Some(desc) = field_description {
+            gql_field.description(desc)
+        } else {
+            gql_field
+        };
+
+        object = object.field(gql_field);
+    }
+
     object
+}
+
+async fn resolve_relationship_field<'a>(
+    ctx: &ResolverContext<'a>,
+    field: &RelationshipField,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    use sqlx::Row;
+
+    let pool = ctx.data::<PgPool>()?;
+    let gql_ctx = ctx.data::<GraphQLContext>()?;
+
+    let Relationship::ForeignKey {
+        foreign_table,
+        cardinality,
+        ..
+    } = &field.relationship
+    else {
+        return Err(async_graphql::Error::new(
+            "computed relationship fields are not supported yet",
+        ));
+    };
+
+    if matches!(cardinality, Cardinality::M2M(_)) {
+        return Err(async_graphql::Error::new(
+            "many-to-many relationship fields are not supported yet",
+        ));
+    }
+
+    let Some(Value::Object(parent)) = ctx.parent_value.as_value() else {
+        return if field.is_list {
+            Ok(Some(FieldValue::list(Vec::<FieldValue>::new())))
+        } else {
+            Ok(None)
+        };
+    };
+
+    let target_table = table_metadata(gql_ctx, &foreign_table.schema, &foreign_table.name).await?;
+    let join_columns = field.join_columns();
+    if join_columns.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "relationship field `{}` has no join columns",
+            field.name
+        )));
+    }
+
+    let mut values = Vec::with_capacity(join_columns.len());
+    let mut conditions = Vec::with_capacity(join_columns.len());
+    for (idx, (source_col, target_col)) in join_columns.iter().enumerate() {
+        let Some(value) = parent.get(&async_graphql::Name::new(source_col)) else {
+            return if field.is_list {
+                Ok(Some(FieldValue::list(Vec::<FieldValue>::new())))
+            } else {
+                Ok(None)
+            };
+        };
+
+        if matches!(value, Value::Null) {
+            return if field.is_list {
+                Ok(Some(FieldValue::list(Vec::<FieldValue>::new())))
+            } else {
+                Ok(None)
+            };
+        }
+
+        values.push(BoundValue {
+            column_name: target_col.clone(),
+            value: value_to_json(value),
+        });
+        conditions.push(format!(
+            "{} = ${}",
+            postrust_sql::escape_ident(target_col),
+            idx + 1
+        ));
+    }
+
+    let sql = format!(
+        "SELECT row_to_json(t) FROM (SELECT * FROM {}.{} WHERE {}) t",
+        postrust_sql::escape_ident(&foreign_table.schema),
+        postrust_sql::escape_ident(&foreign_table.name),
+        conditions.join(" AND ")
+    );
+
+    trace!("Executing relationship SQL: {}", sql);
+
+    let mut tx = begin_request_tx(pool, gql_ctx).await?;
+    let query = bind_table_values(&sql, &target_table, &values)?;
+
+    let rows = query.fetch_all(&mut *tx).await?;
+
+    tx.commit().await?;
+
+    let results: Vec<FieldValue> = rows
+        .iter()
+        .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
+        .map(|v| FieldValue::value(json_to_value(v)))
+        .collect();
+
+    if field.is_list {
+        Ok(Some(FieldValue::list(results)))
+    } else {
+        Ok(results.into_iter().next())
+    }
 }
 
 /// Create the Query type with all table query fields.
@@ -2077,7 +2215,7 @@ mod tests {
     fn test_create_object_type() {
         let table = create_test_table("users");
         let obj = TableObjectType::from_table(&table);
-        let _gql_obj = create_object_type(&obj);
+        let _gql_obj = create_object_type(&obj, &[], false, false);
     }
 
     #[test]
