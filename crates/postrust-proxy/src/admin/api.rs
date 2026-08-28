@@ -1,6 +1,6 @@
 //! REST API endpoints for proxy management.
 
-use crate::config::{Backend, Route, RouteMatch, Upstream, HealthCheckConfig, LoadBalanceStrategy};
+use crate::config::{Backend, HealthCheckConfig, LoadBalanceStrategy, Route, RouteMatch, Upstream};
 use crate::error::ProxyError;
 use crate::ProxyState;
 use axum::{
@@ -61,7 +61,10 @@ pub fn admin_router() -> Router<Arc<ProxyState>> {
         // Backends
         .route("/upstreams/:id/backends", get(list_backends))
         .route("/upstreams/:id/backends", post(add_backend))
-        .route("/upstreams/:id/backends/:backend_id", delete(remove_backend))
+        .route(
+            "/upstreams/:id/backends/:backend_id",
+            delete(remove_backend),
+        )
         // Health
         .route("/health", get(health_status))
         .route("/health/:backend_id", get(backend_health))
@@ -73,9 +76,7 @@ pub fn admin_router() -> Router<Arc<ProxyState>> {
 
 // Route handlers
 
-async fn list_routes(
-    State(state): State<Arc<ProxyState>>,
-) -> impl IntoResponse {
+async fn list_routes(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
     let config = state.config.read().await;
     let routes = config.routes.clone();
     Json(ApiResponse::success(routes))
@@ -195,9 +196,7 @@ async fn delete_route(
 
 // Upstream handlers
 
-async fn list_upstreams(
-    State(state): State<Arc<ProxyState>>,
-) -> impl IntoResponse {
+async fn list_upstreams(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
     let config = state.config.read().await;
     let upstreams = config.upstreams.clone();
     Json(ApiResponse::success(upstreams))
@@ -335,7 +334,11 @@ async fn add_backend(
 ) -> impl IntoResponse {
     let mut config = state.config.write().await;
 
-    if let Some(upstream) = config.upstreams.iter_mut().find(|u| u.id == Some(upstream_id)) {
+    if let Some(upstream) = config
+        .upstreams
+        .iter_mut()
+        .find(|u| u.id == Some(upstream_id))
+    {
         let backend = Backend {
             id: Some(Uuid::new_v4()),
             address: req.address,
@@ -363,7 +366,11 @@ async fn remove_backend(
 ) -> impl IntoResponse {
     let mut config = state.config.write().await;
 
-    if let Some(upstream) = config.upstreams.iter_mut().find(|u| u.id == Some(upstream_id)) {
+    if let Some(upstream) = config
+        .upstreams
+        .iter_mut()
+        .find(|u| u.id == Some(upstream_id))
+    {
         let len_before = upstream.backends.len();
         upstream.backends.retain(|b| b.id != Some(backend_id));
 
@@ -395,9 +402,7 @@ pub struct HealthSummary {
     pub unhealthy_backends: usize,
 }
 
-async fn health_status(
-    State(state): State<Arc<ProxyState>>,
-) -> impl IntoResponse {
+async fn health_status(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
     let config = state.config.read().await;
 
     let mut total = 0;
@@ -437,9 +442,7 @@ async fn backend_health(
 
 // Config handlers
 
-async fn reload_config(
-    State(state): State<Arc<ProxyState>>,
-) -> impl IntoResponse {
+async fn reload_config(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
     state.config_reloader.request_reload().await;
     Json(ApiResponse::success("Configuration reload requested"))
 }
@@ -453,9 +456,7 @@ pub struct ProxyStats {
     pub backends_count: usize,
 }
 
-async fn get_stats(
-    State(state): State<Arc<ProxyState>>,
-) -> impl IntoResponse {
+async fn get_stats(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
     let config = state.config.read().await;
 
     let backends_count: usize = config.upstreams.iter().map(|u| u.backends.len()).sum();

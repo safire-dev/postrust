@@ -2,11 +2,11 @@
 //!
 //! Handles content negotiation and response formatting for JSON, CSV, and other formats.
 
-mod json;
 mod headers;
+mod json;
 
-pub use json::format_json_response;
 pub use headers::{build_response_headers, ContentRange};
+pub use json::format_json_response;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
 use postrust_core::{ActionPlan, ApiRequest, MediaType, PreferRepresentation};
@@ -130,7 +130,9 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     }
 
     // Preference-Applied
-    if let Some(applied) = postrust_core::api_request::preferences::preference_applied(&request.preferences) {
+    if let Some(applied) =
+        postrust_core::api_request::preferences::preference_applied(&request.preferences)
+    {
         response.set_header("preference-applied", &applied);
     }
 
@@ -141,7 +143,10 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
 }
 
 /// Format singular JSON (single object or null).
-fn format_singular_json(rows: &[serde_json::Value], nullable: bool) -> Result<bytes::Bytes, FormatError> {
+fn format_singular_json(
+    rows: &[serde_json::Value],
+    nullable: bool,
+) -> Result<bytes::Bytes, FormatError> {
     match rows.len() {
         0 if nullable => Ok(bytes::Bytes::from_static(b"null")),
         0 => Err(FormatError::NotFound),
@@ -170,12 +175,7 @@ fn format_csv_response(rows: &[serde_json::Value]) -> Result<bytes::Bytes, Forma
                 if let serde_json::Value::Object(row_map) = row {
                     let values: Vec<String> = headers
                         .iter()
-                        .map(|h| {
-                            row_map
-                                .get(*h)
-                                .map(|v| csv_escape(v))
-                                .unwrap_or_default()
-                        })
+                        .map(|h| row_map.get(*h).map(|v| csv_escape(v)).unwrap_or_default())
                         .collect();
                     output.extend_from_slice(values.join(",").as_bytes());
                     output.push(b'\n');

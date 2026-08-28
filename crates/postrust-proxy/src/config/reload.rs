@@ -5,7 +5,7 @@ use crate::error::ProxyResult;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// Configuration change event.
 #[derive(Debug, Clone)]

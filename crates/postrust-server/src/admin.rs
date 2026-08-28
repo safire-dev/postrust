@@ -602,10 +602,7 @@ mod tests {
         // Serialize to JSON and check tag names
         let json = serde_json::to_value(&spec).unwrap();
         let tags = json["tags"].as_array().unwrap();
-        let tag_names: Vec<&str> = tags
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let tag_names: Vec<&str> = tags.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tag_names.contains(&"tables"));
         assert!(tag_names.contains(&"rpc"));
         assert!(tag_names.contains(&"graphql"));

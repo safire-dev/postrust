@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Health status for a backend.
@@ -156,12 +156,7 @@ impl HealthChecker {
             );
 
             let start = Instant::now();
-            let result = self
-                .client
-                .get(&health_url)
-                .timeout(timeout)
-                .send()
-                .await;
+            let result = self.client.get(&health_url).timeout(timeout).send().await;
             let response_time = start.elapsed().as_millis() as u64;
 
             self.update_health(
@@ -182,7 +177,10 @@ impl HealthChecker {
         healthy_threshold: u32,
         unhealthy_threshold: u32,
     ) {
-        let mut health = self.health.entry(backend_id).or_insert(BackendHealth::default());
+        let mut health = self
+            .health
+            .entry(backend_id)
+            .or_insert(BackendHealth::default());
 
         health.last_check = Utc::now();
         health.response_time_ms = Some(response_time);

@@ -56,15 +56,10 @@ impl ServerName {
         if self.0.starts_with("*.") {
             let suffix = &self.0[2..];
             if host.ends_with(suffix) {
-                // Ensure it's a subdomain match, not just suffix match
                 let prefix_len = host.len() - suffix.len();
-                if prefix_len > 0 && host.chars().nth(prefix_len - 1) == Some('.') {
-                    return true;
-                }
-                // Single subdomain level (e.g., sub.example.com for *.example.com)
-                if prefix_len > 0 && !host[..prefix_len - 1].contains('.') {
-                    return true;
-                }
+                return prefix_len > 1
+                    && host.chars().nth(prefix_len - 1) == Some('.')
+                    && !host[..prefix_len - 1].contains('.');
             }
         }
 

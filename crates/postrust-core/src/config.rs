@@ -252,7 +252,10 @@ impl AppConfig {
 
     /// Get the default schema (first in the list).
     pub fn default_schema(&self) -> &str {
-        self.db_schemas.first().map(|s| s.as_str()).unwrap_or("public")
+        self.db_schemas
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("public")
     }
 }
 

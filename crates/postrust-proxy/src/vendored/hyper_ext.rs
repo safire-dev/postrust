@@ -43,12 +43,12 @@ impl IncomingBodyExt for hyper::body::Incoming {
 
 /// Timer utilities for request timeouts.
 pub mod timer {
+    use pin_project_lite::pin_project;
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::time::{sleep, Sleep};
-    use pin_project_lite::pin_project;
 
     pin_project! {
         /// A future that resolves after a timeout or when the inner future completes.

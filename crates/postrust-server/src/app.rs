@@ -16,10 +16,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Main request handler.
-pub async fn handle_request(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-) -> Response {
+pub async fn handle_request(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
 
@@ -43,8 +40,7 @@ async fn process_request(
         .and_then(|v| v.to_str().ok());
 
     // Authenticate
-    let auth_result = authenticate(auth_header, &state.jwt_config)
-        .map_err(map_auth_error)?;
+    let auth_result = authenticate(auth_header, &state.jwt_config).map_err(map_auth_error)?;
 
     debug!("Authenticated as role: {}", auth_result.role);
 
@@ -68,11 +64,7 @@ async fn process_request(
         .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request = parse_request(
-        &http_request,
-        state.default_schema(),
-        state.schemas(),
-    )?;
+    let mut api_request = parse_request(&http_request, state.default_schema(), state.schemas())?;
 
     // Parse payload
     if !body_bytes.is_empty() {
@@ -125,7 +117,10 @@ async fn execute_plan(
             // Execute query inside a single transaction so SET LOCAL ROLE and the
             // request.jwt.claims.* GUCs stay in force for the query and reset on
             // COMMIT (keeping the pooled connection clean for the next request).
-            let mut tx = state.pool.begin().await
+            let mut tx = state
+                .pool
+                .begin()
+                .await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
             // Set role
@@ -135,15 +130,17 @@ async fn execute_plan(
             ))
             .execute(&mut *tx)
             .await
-            .map_err(|e| postrust_core::Error::Database(postrust_core::error::DatabaseError {
-                code: "42501".into(),
-                message: e.to_string(),
-                details: None,
-                hint: None,
-                constraint: None,
-                table: None,
-                column: None,
-            }))?;
+            .map_err(|e| {
+                postrust_core::Error::Database(postrust_core::error::DatabaseError {
+                    code: "42501".into(),
+                    message: e.to_string(),
+                    details: None,
+                    hint: None,
+                    constraint: None,
+                    table: None,
+                    column: None,
+                })
+            })?;
 
             // Set claims as GUC
             for (key, value) in &auth.claims {
@@ -173,10 +170,8 @@ async fn execute_plan(
             tx.commit().await.map_err(map_sqlx_error)?;
 
             // Convert rows to JSON
-            let json_rows: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|row| row_to_json(row))
-                .collect();
+            let json_rows: Vec<serde_json::Value> =
+                rows.iter().map(|row| row_to_json(row)).collect();
 
             Ok(QueryResult {
                 status: StatusCode::OK,
@@ -344,7 +339,12 @@ fn map_sqlx_error(e: sqlx::Error) -> postrust_core::Error {
             // Try to downcast to Postgres-specific error for additional details
             let (details, hint) = db_err
                 .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
-                .map(|pg_err| (pg_err.detail().map(String::from), pg_err.hint().map(String::from)))
+                .map(|pg_err| {
+                    (
+                        pg_err.detail().map(String::from),
+                        pg_err.hint().map(String::from),
+                    )
+                })
                 .unwrap_or((None, None));
 
             postrust_core::Error::Database(postrust_core::error::DatabaseError {
