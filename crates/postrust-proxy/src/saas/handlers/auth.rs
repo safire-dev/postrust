@@ -20,17 +20,18 @@ pub async fn create_api_key(
     Auth(auth): Auth,
     Json(req): Json<CreateApiKeyRequest>,
 ) -> impl IntoResponse {
-    match state.api_key_service.create_api_key(auth.tenant_id, req).await {
+    match state
+        .api_key_service
+        .create_api_key(auth.tenant_id, req)
+        .await
+    {
         Ok(api_key) => (StatusCode::CREATED, Json(ApiResponse::success(api_key))).into_response(),
         Err(e) => error_response(e).into_response(),
     }
 }
 
 /// List API keys for the authenticated tenant.
-pub async fn list_api_keys(
-    State(state): State<SaasState>,
-    Auth(auth): Auth,
-) -> impl IntoResponse {
+pub async fn list_api_keys(State(state): State<SaasState>, Auth(auth): Auth) -> impl IntoResponse {
     match state.api_key_service.list_api_keys(auth.tenant_id).await {
         Ok(keys) => Json(ApiResponse::success(keys)).into_response(),
         Err(e) => error_response(e).into_response(),
@@ -43,7 +44,11 @@ pub async fn revoke_api_key(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    match state.api_key_service.revoke_api_key(id, auth.tenant_id).await {
+    match state
+        .api_key_service
+        .revoke_api_key(id, auth.tenant_id)
+        .await
+    {
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,

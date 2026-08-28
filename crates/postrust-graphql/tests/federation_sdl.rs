@@ -145,9 +145,16 @@ async fn sdl_for(cache: SchemaCache, config: SchemaConfig) -> String {
         .expect("federated GraphQL schema should build");
 
     let res = state.schema.execute("{ _service { sdl } }").await;
-    assert!(res.errors.is_empty(), "_service query errored: {:?}", res.errors);
+    assert!(
+        res.errors.is_empty(),
+        "_service query errored: {:?}",
+        res.errors
+    );
 
-    let json = res.data.into_json().expect("response data should serialize to JSON");
+    let json = res
+        .data
+        .into_json()
+        .expect("response data should serialize to JSON");
     json["_service"]["sdl"]
         .as_str()
         .expect("_service.sdl should be a string")
@@ -158,7 +165,11 @@ async fn sdl_for(cache: SchemaCache, config: SchemaConfig) -> String {
 async fn federation_sdl_is_emitted_as_v2() {
     // `connect_lazy` never opens a socket; `_service { sdl }` resolves purely
     // from the schema and never touches the pool.
-    let sdl = sdl_for(schema_cache(), SchemaConfig::default().with_federation(true)).await;
+    let sdl = sdl_for(
+        schema_cache(),
+        SchemaConfig::default().with_federation(true),
+    )
+    .await;
     eprintln!("---FEDERATION SDL---\n{sdl}\n---END SDL---");
 
     assert!(
@@ -184,7 +195,10 @@ async fn type_prefix_namespaces_non_shared_but_shares_entities() {
     eprintln!("---FEDERATION SDL (prefixed)---\n{sdl}\n---END SDL---");
 
     // Non-shared table is namespaced with the prefix.
-    assert!(sdl.contains("type SnowflakeOrders"), "orders type not namespaced:\n{sdl}");
+    assert!(
+        sdl.contains("type SnowflakeOrders"),
+        "orders type not namespaced:\n{sdl}"
+    );
 
     // Shared entity keeps its bare name and stays a keyed entity.
     assert!(
@@ -193,8 +207,14 @@ async fn type_prefix_namespaces_non_shared_but_shares_entities() {
     );
 
     // Root fields are namespaced for both tables so two subgraphs never collide.
-    assert!(sdl.contains("snowflakeOrders"), "orders root field not namespaced:\n{sdl}");
-    assert!(sdl.contains("snowflakeUsers"), "users root field not namespaced:\n{sdl}");
+    assert!(
+        sdl.contains("snowflakeOrders"),
+        "orders root field not namespaced:\n{sdl}"
+    );
+    assert!(
+        sdl.contains("snowflakeUsers"),
+        "users root field not namespaced:\n{sdl}"
+    );
 
     // The shared entity's non-key field is @shareable (key fields are not).
     assert!(
@@ -217,7 +237,11 @@ async fn keyed_types_are_federation_entities() {
         .schema
         .execute(r#"{ __type(name: "_Entity") { possibleTypes { name } } }"#)
         .await;
-    assert!(res.errors.is_empty(), "introspection errored: {:?}", res.errors);
+    assert!(
+        res.errors.is_empty(),
+        "introspection errored: {:?}",
+        res.errors
+    );
     let json = res.data.into_json().unwrap();
     let names: Vec<String> = json["__type"]["possibleTypes"]
         .as_array()
@@ -225,8 +249,14 @@ async fn keyed_types_are_federation_entities() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(names.contains(&"Users".to_string()), "_Entity missing Users: {names:?}");
-    assert!(names.contains(&"Orders".to_string()), "_Entity missing Orders: {names:?}");
+    assert!(
+        names.contains(&"Users".to_string()),
+        "_Entity missing Users: {names:?}"
+    );
+    assert!(
+        names.contains(&"Orders".to_string()),
+        "_Entity missing Orders: {names:?}"
+    );
 
     // The `_entities` root field must be present.
     let res = state
@@ -257,7 +287,10 @@ async fn entity_resolver_rejects_unknown_typename() {
     let ctx = GraphQLContext::new(
         pool.clone(),
         SchemaCacheRef::new(),
-        AuthResult { role: "anon".into(), claims: StdHashMap::new() },
+        AuthResult {
+            role: "anon".into(),
+            claims: StdHashMap::new(),
+        },
     );
     let request = async_graphql::Request::new(
         r#"{ _entities(representations: [{ __typename: "Nonexistent", id: "x" }]) { __typename } }"#,

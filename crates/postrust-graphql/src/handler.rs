@@ -21,11 +21,11 @@ use postrust_core::schema_cache::Cardinality;
 use postrust_core::{Column, QualifiedIdentifier, Relationship, SchemaCache, Table};
 use sqlx::types::{BigDecimal, Json};
 use sqlx::PgPool;
-use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace};
+use uuid::Uuid;
 
 /// GraphQL execution state shared across requests.
 pub struct GraphQLState {
@@ -452,9 +452,7 @@ fn create_object_type(
         let relationship_for_resolver = relationship.clone();
         let gql_field = Field::new(&field_name, field_type, move |ctx| {
             let relationship = relationship_for_resolver.clone();
-            FieldFuture::new(async move {
-                resolve_relationship_field(&ctx, &relationship).await
-            })
+            FieldFuture::new(async move { resolve_relationship_field(&ctx, &relationship).await })
         });
 
         let gql_field = if let Some(desc) = field_description {
@@ -591,9 +589,9 @@ fn create_query_type(generated: &GeneratedSchema, enable_federation: bool) -> Ob
             Field::new(&field.name, return_type, move |ctx| {
                 let table_name = table_name_c.clone();
                 let schema_name = schema_name_c.clone();
-                FieldFuture::new(async move {
-                    resolve_count(&ctx, &schema_name, &table_name).await
-                })
+                FieldFuture::new(
+                    async move { resolve_count(&ctx, &schema_name, &table_name).await },
+                )
             })
         } else {
             let table_name_q = table_name.clone();
@@ -624,8 +622,7 @@ fn create_query_type(generated: &GeneratedSchema, enable_federation: bool) -> Ob
 
         // Add arguments
         if is_count {
-            gql_field = gql_field
-                .argument(InputValue::new("filter", TypeRef::named("JSON")));
+            gql_field = gql_field.argument(InputValue::new("filter", TypeRef::named("JSON")));
         } else if !is_by_pk {
             gql_field = gql_field
                 .argument(InputValue::new("filter", TypeRef::named("JSON")))
@@ -634,10 +631,7 @@ fn create_query_type(generated: &GeneratedSchema, enable_federation: bool) -> Ob
                 .argument(InputValue::new("offset", TypeRef::named("Int")));
         } else {
             // Single PK column, matching react-admin + ra-data-graphql getOne (variable `id`)
-            let id_scalar = field
-                .by_pk_id_type
-                .as_deref()
-                .unwrap_or("Int");
+            let id_scalar = field.by_pk_id_type.as_deref().unwrap_or("Int");
             gql_field = gql_field.argument(InputValue::new("id", TypeRef::named_nn(id_scalar)));
         }
 
@@ -650,9 +644,9 @@ fn create_query_type(generated: &GeneratedSchema, enable_federation: bool) -> Ob
 
     // Add introspection queries
     let mut schema_field = Field::new("_schema", TypeRef::named("String"), |_| {
-        FieldFuture::new(async move {
-            Ok(Some(Value::String("Postrust GraphQL Schema".to_string())))
-        })
+        FieldFuture::new(
+            async move { Ok(Some(Value::String("Postrust GraphQL Schema".to_string()))) },
+        )
     })
     .description("Schema introspection");
     // Emitted identically by every subgraph; mark @shareable so a federated
@@ -686,8 +680,8 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
         // Add mutation-specific arguments
         match mutation_type {
             MutationType::Insert | MutationType::InsertOne => {
-                gql_field = gql_field
-                    .argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
+                gql_field =
+                    gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
             }
             MutationType::Update | MutationType::UpdateByPk => {
                 gql_field = gql_field
@@ -725,9 +719,9 @@ fn create_subscription_type(fields: &[SubField]) -> Subscription {
                 let broker_arc = ctx.data::<Arc<RwLock<Option<NotifyBroker>>>>()?;
                 let broker_guard = broker_arc.read().await;
 
-                let broker = broker_guard
-                    .as_ref()
-                    .ok_or_else(|| async_graphql::Error::new("Subscription broker not initialized"))?;
+                let broker = broker_guard.as_ref().ok_or_else(|| {
+                    async_graphql::Error::new("Subscription broker not initialized")
+                })?;
 
                 let stream = broker
                     .subscribe(&channel_name)
@@ -824,7 +818,14 @@ async fn execute_by_pk_one(
     value: ByPkParam,
     ctx: &GraphQLContext,
 ) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
-    execute_by_key_one(pool, schema_name, table_name, &[(pk_col.to_string(), value)], ctx).await
+    execute_by_key_one(
+        pool,
+        schema_name,
+        table_name,
+        &[(pk_col.to_string(), value)],
+        ctx,
+    )
+    .await
 }
 
 /// `SELECT * … WHERE c1 = $1 AND c2 = $2 …` for a (possibly composite) key.
@@ -921,7 +922,10 @@ fn coerce_key_value(
             async_graphql::Error::new(format!("entity key `{}` must be a UUID string", col.name))
         })?;
         let u = Uuid::parse_str(s).map_err(|e| {
-            async_graphql::Error::new(format!("entity key `{}` is not a valid UUID: {e}", col.name))
+            async_graphql::Error::new(format!(
+                "entity key `{}` is not a valid UUID: {e}",
+                col.name
+            ))
         })?;
         Ok(ByPkParam::Uuid(u))
     } else {
@@ -969,17 +973,13 @@ async fn resolve_query<'a>(
                 let n = j
                     .as_i64()
                     .or_else(|| j.as_u64().and_then(|u| i64::try_from(u).ok()))
-                    .ok_or_else(|| {
-                        async_graphql::Error::new("by-pk `id` must be an integer")
-                    })?;
+                    .ok_or_else(|| async_graphql::Error::new("by-pk `id` must be an integer"))?;
                 ByPkParam::I64(n)
             }
             "UUID" => {
                 let s = j
                     .as_str()
-                    .ok_or_else(|| {
-                        async_graphql::Error::new("by-pk `id` must be a UUID string")
-                    })?;
+                    .ok_or_else(|| async_graphql::Error::new("by-pk `id` must be a UUID string"))?;
                 let u = Uuid::parse_str(s).map_err(|e| {
                     async_graphql::Error::new(format!("by-pk `id` is not a valid UUID: {e}"))
                 })?;
@@ -1000,24 +1000,17 @@ async fn resolve_query<'a>(
                 ByPkParam::String(s)
             }
         };
-        let result = execute_by_pk_one(pool, schema_name, table_name, pk_col, param, gql_ctx).await?;
+        let result =
+            execute_by_pk_one(pool, schema_name, table_name, pk_col, param, gql_ctx).await?;
         return Ok(result
             .into_iter()
             .next()
             .map(|v| FieldValue::value(json_to_value(v))));
     }
 
-    let limit: Option<i64> = ctx
-        .args
-        .try_get("limit")
-        .ok()
-        .and_then(|v| v.i64().ok());
+    let limit: Option<i64> = ctx.args.try_get("limit").ok().and_then(|v| v.i64().ok());
 
-    let offset: Option<i64> = ctx
-        .args
-        .try_get("offset")
-        .ok()
-        .and_then(|v| v.i64().ok());
+    let offset: Option<i64> = ctx.args.try_get("offset").ok().and_then(|v| v.i64().ok());
 
     let filter_value = ctx
         .args
@@ -1036,7 +1029,14 @@ async fn resolve_query<'a>(
                 .collect()
         });
 
-    let (sql, where_values) = build_list_sql(schema_name, table_name, filter_value.as_ref(), order_by.as_deref(), limit, offset)?;
+    let (sql, where_values) = build_list_sql(
+        schema_name,
+        table_name,
+        filter_value.as_ref(),
+        order_by.as_deref(),
+        limit,
+        offset,
+    )?;
     let table = table_metadata(gql_ctx, schema_name, table_name).await?;
 
     let mut tx = begin_request_tx(pool, gql_ctx).await?;
@@ -1165,7 +1165,10 @@ async fn resolve_mutation<'a>(
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
 
-    debug!("Resolving mutation for table: {} type: {:?}", table_name, mutation_type);
+    debug!(
+        "Resolving mutation for table: {} type: {:?}",
+        table_name, mutation_type
+    );
 
     let result = match mutation_type {
         MutationType::Insert | MutationType::InsertOne => {
@@ -1176,7 +1179,15 @@ async fn resolve_mutation<'a>(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::Value::Array(vec![]));
 
-            execute_insert(pool, schema_name, table_name, gql_ctx, objects, mutation_type).await?
+            execute_insert(
+                pool,
+                schema_name,
+                table_name,
+                gql_ctx,
+                objects,
+                mutation_type,
+            )
+            .await?
         }
         MutationType::Update | MutationType::UpdateByPk => {
             let set_value = ctx
@@ -1186,28 +1197,36 @@ async fn resolve_mutation<'a>(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::json!({}));
 
-            let where_clause = ctx
-                .args
-                .try_get("where")
-                .ok()
-                .map(|v| accessor_to_json(&v));
+            let where_clause = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v));
 
-            execute_update(pool, schema_name, table_name, gql_ctx, set_value, where_clause, mutation_type).await?
+            execute_update(
+                pool,
+                schema_name,
+                table_name,
+                gql_ctx,
+                set_value,
+                where_clause,
+                mutation_type,
+            )
+            .await?
         }
         MutationType::Delete | MutationType::DeleteByPk => {
-            let where_clause = ctx
-                .args
-                .try_get("where")
-                .ok()
-                .map(|v| accessor_to_json(&v));
+            let where_clause = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v));
 
-            execute_delete(pool, schema_name, table_name, gql_ctx, where_clause, mutation_type).await?
+            execute_delete(
+                pool,
+                schema_name,
+                table_name,
+                gql_ctx,
+                where_clause,
+                mutation_type,
+            )
+            .await?
         }
     };
 
     Ok(result)
 }
-
 
 /// Execute an insert mutation.
 async fn execute_insert<'a>(
@@ -1226,7 +1245,11 @@ async fn execute_insert<'a>(
     let objects_array = match objects {
         serde_json::Value::Array(arr) => arr,
         serde_json::Value::Object(obj) => vec![serde_json::Value::Object(obj)],
-        _ => return Err(async_graphql::Error::new("objects must be an array or object")),
+        _ => {
+            return Err(async_graphql::Error::new(
+                "objects must be an array or object",
+            ))
+        }
     };
 
     if objects_array.is_empty() {
@@ -1242,13 +1265,18 @@ async fn execute_insert<'a>(
         if let serde_json::Value::Object(map) = obj {
             // Build INSERT query
             let columns: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
-            let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${}", i)).collect();
+            let placeholders: Vec<String> =
+                (1..=columns.len()).map(|i| format!("${}", i)).collect();
 
             let sql = format!(
                 "INSERT INTO {}.{} ({}) VALUES ({}) RETURNING row_to_json({}.{}.*)",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
-                columns.iter().map(|c| postrust_sql::escape_ident(c)).collect::<Vec<_>>().join(", "),
+                columns
+                    .iter()
+                    .map(|c| postrust_sql::escape_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 placeholders.join(", "),
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name)
@@ -1339,10 +1367,8 @@ fn bind_table_values<'q>(
     sql: &'q str,
     table: &Table,
     values: &[BoundValue],
-) -> Result<
-    sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    async_graphql::Error,
-> {
+) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>, async_graphql::Error>
+{
     let columns: Vec<&Column> = values
         .iter()
         .map(|value| {
@@ -1433,9 +1459,7 @@ fn coerce_column_value(
                 .and_then(|value| i32::try_from(value).ok())
                 .ok_or_else(invalid)?,
         )),
-        "bigint" | "int8" => {
-            TypedColumnValue::I64(Some(value.as_i64().ok_or_else(invalid)?))
-        }
+        "bigint" | "int8" => TypedColumnValue::I64(Some(value.as_i64().ok_or_else(invalid)?)),
         "real" | "float4" => {
             TypedColumnValue::F32(Some(value.as_f64().ok_or_else(invalid)? as f32))
         }
@@ -1450,9 +1474,7 @@ fn coerce_column_value(
                 .parse::<BigDecimal>()
                 .map_err(|_| invalid())?,
         )),
-        "boolean" | "bool" => {
-            TypedColumnValue::Bool(Some(value.as_bool().ok_or_else(invalid)?))
-        }
+        "boolean" | "bool" => TypedColumnValue::Bool(Some(value.as_bool().ok_or_else(invalid)?)),
         "uuid" => TypedColumnValue::Uuid(Some(
             value
                 .as_str()
@@ -1461,9 +1483,7 @@ fn coerce_column_value(
                 .map_err(|_| invalid())?,
         )),
         "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" => {
-            TypedColumnValue::String(Some(
-                value.as_str().ok_or_else(invalid)?.to_string(),
-            ))
+            TypedColumnValue::String(Some(value.as_str().ok_or_else(invalid)?.to_string()))
         }
         "json" | "jsonb" => TypedColumnValue::Json(Some(Json(value.clone()))),
         _ => return Ok(None),
@@ -1566,7 +1586,11 @@ async fn execute_update<'a>(
     let mut set_parts: Vec<String> = Vec::new();
     let mut param_idx = 1;
     for key in set_map.keys() {
-        set_parts.push(format!("{} = ${}", postrust_sql::escape_ident(key), param_idx));
+        set_parts.push(format!(
+            "{} = ${}",
+            postrust_sql::escape_ident(key),
+            param_idx
+        ));
         param_idx += 1;
     }
 
@@ -1604,12 +1628,8 @@ async fn execute_update<'a>(
 
     // Return based on mutation type
     match mutation_type {
-        MutationType::UpdateByPk => {
-            Ok(updated.into_iter().next())
-        }
-        _ => {
-            Ok(Some(FieldValue::list(updated)))
-        }
+        MutationType::UpdateByPk => Ok(updated.into_iter().next()),
+        _ => Ok(Some(FieldValue::list(updated))),
     }
 }
 
@@ -1657,12 +1677,8 @@ async fn execute_delete<'a>(
 
     // Return based on mutation type
     match mutation_type {
-        MutationType::DeleteByPk => {
-            Ok(deleted.into_iter().next())
-        }
-        _ => {
-            Ok(Some(FieldValue::list(deleted)))
-        }
+        MutationType::DeleteByPk => Ok(deleted.into_iter().next()),
+        _ => Ok(Some(FieldValue::list(deleted))),
     }
 }
 
@@ -1688,15 +1704,18 @@ fn build_where_clause(
                                         conditions.push("FALSE".to_string());
                                     } else {
                                         let col = postrust_sql::escape_ident(key);
-                                        let parts: Vec<String> = arr.iter().map(|v| {
-                                            let placeholder = format!("${}", param_idx);
-                                            values.push(BoundValue {
-                                                column_name: key.clone(),
-                                                value: v.clone(),
-                                            });
-                                            param_idx += 1;
-                                            format!("{} = {}", col, placeholder)
-                                        }).collect();
+                                        let parts: Vec<String> = arr
+                                            .iter()
+                                            .map(|v| {
+                                                let placeholder = format!("${}", param_idx);
+                                                values.push(BoundValue {
+                                                    column_name: key.clone(),
+                                                    value: v.clone(),
+                                                });
+                                                param_idx += 1;
+                                                format!("{} = {}", col, placeholder)
+                                            })
+                                            .collect();
                                         if parts.len() == 1 {
                                             conditions.push(parts.into_iter().next().unwrap());
                                         } else {
@@ -1707,21 +1726,59 @@ fn build_where_clause(
                             }
                             "is_null" | "_is_null" => {
                                 if op_val.as_bool().unwrap_or(false) {
-                                    conditions.push(format!("{} IS NULL", postrust_sql::escape_ident(key)));
+                                    conditions.push(format!(
+                                        "{} IS NULL",
+                                        postrust_sql::escape_ident(key)
+                                    ));
                                 } else {
-                                    conditions.push(format!("{} IS NOT NULL", postrust_sql::escape_ident(key)));
+                                    conditions.push(format!(
+                                        "{} IS NOT NULL",
+                                        postrust_sql::escape_ident(key)
+                                    ));
                                 }
                             }
                             _ => {
                                 let condition = match op.as_str() {
-                                    "eq" | "_eq" => format!("{} = ${}", postrust_sql::escape_ident(key), param_idx),
-                                    "neq" | "_neq" => format!("{} != ${}", postrust_sql::escape_ident(key), param_idx),
-                                    "gt" | "_gt" => format!("{} > ${}", postrust_sql::escape_ident(key), param_idx),
-                                    "gte" | "_gte" => format!("{} >= ${}", postrust_sql::escape_ident(key), param_idx),
-                                    "lt" | "_lt" => format!("{} < ${}", postrust_sql::escape_ident(key), param_idx),
-                                    "lte" | "_lte" => format!("{} <= ${}", postrust_sql::escape_ident(key), param_idx),
-                                    "like" | "_like" => format!("{} LIKE ${}", postrust_sql::escape_ident(key), param_idx),
-                                    "ilike" | "_ilike" => format!("{} ILIKE ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "eq" | "_eq" => format!(
+                                        "{} = ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
+                                    "neq" | "_neq" => format!(
+                                        "{} != ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
+                                    "gt" | "_gt" => format!(
+                                        "{} > ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
+                                    "gte" | "_gte" => format!(
+                                        "{} >= ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
+                                    "lt" | "_lt" => format!(
+                                        "{} < ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
+                                    "lte" | "_lte" => format!(
+                                        "{} <= ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
+                                    "like" | "_like" => format!(
+                                        "{} LIKE ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
+                                    "ilike" | "_ilike" => format!(
+                                        "{} ILIKE ${}",
+                                        postrust_sql::escape_ident(key),
+                                        param_idx
+                                    ),
                                     _ => continue,
                                 };
                                 conditions.push(condition);
@@ -1736,7 +1793,11 @@ fn build_where_clause(
                 }
                 _ => {
                     // Direct equality: {field: value}
-                    conditions.push(format!("{} = ${}", postrust_sql::escape_ident(key), param_idx));
+                    conditions.push(format!(
+                        "{} = ${}",
+                        postrust_sql::escape_ident(key),
+                        param_idx
+                    ));
                     values.push(BoundValue {
                         column_name: key.clone(),
                         value: val.clone(),
@@ -1765,9 +1826,9 @@ fn graphql_type_ref(type_str: &str) -> TypeRef {
     // Strip outer modifiers: first the trailing !, then the brackets
     let inner = if is_list {
         let stripped = type_str
-            .trim_end_matches('!')  // Remove outer !
-            .trim_start_matches('[')  // Remove [
-            .trim_end_matches(']');   // Remove ]
+            .trim_end_matches('!') // Remove outer !
+            .trim_start_matches('[') // Remove [
+            .trim_end_matches(']'); // Remove ]
         stripped
     } else {
         type_str.trim_end_matches('!')
@@ -1811,11 +1872,7 @@ fn accessor_to_json(accessor: &ValueAccessor<'_>) -> serde_json::Value {
     } else if let Ok(s) = accessor.string() {
         serde_json::Value::String(s.to_string())
     } else if let Ok(list) = accessor.list() {
-        serde_json::Value::Array(
-            list.iter()
-                .map(|v| accessor_to_json(&v))
-                .collect()
-        )
+        serde_json::Value::Array(list.iter().map(|v| accessor_to_json(&v)).collect())
     } else if let Ok(obj) = accessor.object() {
         let map: serde_json::Map<String, serde_json::Value> = obj
             .iter()
@@ -1843,9 +1900,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
         }
         Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::List(arr) => {
-            serde_json::Value::Array(arr.iter().map(value_to_json).collect())
-        }
+        Value::List(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
         Value::Object(obj) => {
             let map: serde_json::Map<String, serde_json::Value> = obj
                 .iter()
@@ -1876,9 +1931,7 @@ fn json_to_value(json: serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(s),
-        serde_json::Value::Array(arr) => {
-            Value::List(arr.into_iter().map(json_to_value).collect())
-        }
+        serde_json::Value::Array(arr) => Value::List(arr.into_iter().map(json_to_value).collect()),
         serde_json::Value::Object(obj) => {
             let map: indexmap::IndexMap<async_graphql::Name, Value> = obj
                 .into_iter()
@@ -1905,8 +1958,7 @@ fn create_bigint_scalar() -> Scalar {
 
 /// Create BigDecimal scalar type.
 fn create_bigdecimal_scalar() -> Scalar {
-    Scalar::new("BigDecimal")
-        .description("Arbitrary precision decimal number")
+    Scalar::new("BigDecimal").description("Arbitrary precision decimal number")
 }
 
 /// Create JSON scalar type.
@@ -2259,11 +2311,10 @@ mod tests {
         let _generated = build_schema(&cache, &config);
 
         // Build a minimal schema with filter types
-        let query = Object::new("Query").field(Field::new(
-            "test",
-            TypeRef::named("String"),
-            |_| FieldFuture::new(async { Ok(None::<FieldValue>) }),
-        ));
+        let query =
+            Object::new("Query").field(Field::new("test", TypeRef::named("String"), |_| {
+                FieldFuture::new(async { Ok(None::<FieldValue>) })
+            }));
 
         let mut builder = Schema::build("Query", None::<&str>, None);
         builder = builder.register(query);
@@ -2349,8 +2400,7 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_order_by_asc() {
         let order = vec!["name_ASC".to_string()];
-        let (sql, _) =
-            build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
+        let (sql, _) = build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
         assert!(
             sql.contains(r#"ORDER BY "name" ASC"#),
             "Expected ORDER BY clause in SQL: {}",
@@ -2361,8 +2411,7 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_order_by_desc() {
         let order = vec!["createdAt_DESC".to_string()];
-        let (sql, _) =
-            build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
+        let (sql, _) = build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
         assert!(
             sql.contains(r#"ORDER BY "createdAt" DESC"#),
             "Expected ORDER BY clause in SQL: {}",
@@ -2373,8 +2422,7 @@ mod tests {
     #[test]
     fn test_build_list_sql_with_multiple_order_by() {
         let order = vec!["name_ASC".to_string(), "id_DESC".to_string()];
-        let (sql, _) =
-            build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
+        let (sql, _) = build_list_sql("public", "users", None, Some(&order), None, None).unwrap();
         assert!(
             sql.contains(r#"ORDER BY "name" ASC, "id" DESC"#),
             "Expected multi-column ORDER BY in SQL: {}",
@@ -2430,7 +2478,11 @@ mod tests {
         )
         .unwrap();
         assert!(sql.contains("WHERE"), "Missing WHERE: {}", sql);
-        assert!(sql.contains(r#"ORDER BY "name" ASC"#), "Missing ORDER BY: {}", sql);
+        assert!(
+            sql.contains(r#"ORDER BY "name" ASC"#),
+            "Missing ORDER BY: {}",
+            sql
+        );
         assert!(sql.contains("LIMIT 25"), "Missing LIMIT: {}", sql);
         assert!(sql.contains("OFFSET 50"), "Missing OFFSET: {}", sql);
         assert_eq!(values.len(), 1);
@@ -2438,8 +2490,7 @@ mod tests {
 
     #[test]
     fn test_build_list_sql_escapes_table_name() {
-        let (sql, _) =
-            build_list_sql("public", "user accounts", None, None, None, None).unwrap();
+        let (sql, _) = build_list_sql("public", "user accounts", None, None, None, None).unwrap();
         assert!(
             sql.contains(r#""public"."user accounts""#),
             "Table name not escaped: {}",

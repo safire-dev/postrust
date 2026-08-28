@@ -1,7 +1,7 @@
 //! Database-backed configuration loading.
 
-use crate::error::{ProxyResult, ProxyError};
-use crate::config::{Route, Upstream, Backend, HealthCheckConfig, LoadBalanceStrategy};
+use crate::config::{Backend, HealthCheckConfig, LoadBalanceStrategy, Route, Upstream};
+use crate::error::{ProxyError, ProxyResult};
 use sqlx::PgPool;
 
 /// Load routes from the database.

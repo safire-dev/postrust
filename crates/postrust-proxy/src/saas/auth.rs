@@ -280,16 +280,25 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid Authorization header format".to_string(),
             ),
-            AuthError::InvalidToken(msg) => (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", msg)),
+            AuthError::InvalidToken(msg) => {
+                (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", msg))
+            }
             AuthError::TokenExpired => (StatusCode::UNAUTHORIZED, "Token has expired".to_string()),
             AuthError::MissingClaim(claim) => (
                 StatusCode::UNAUTHORIZED,
                 format!("Missing required claim: {}", claim),
             ),
             AuthError::InvalidApiKey => (StatusCode::UNAUTHORIZED, "Invalid API key".to_string()),
-            AuthError::ApiKeyDisabled => (StatusCode::UNAUTHORIZED, "API key is disabled".to_string()),
-            AuthError::ApiKeyExpired => (StatusCode::UNAUTHORIZED, "API key has expired".to_string()),
-            AuthError::TenantSuspended => (StatusCode::FORBIDDEN, "Tenant account is suspended".to_string()),
+            AuthError::ApiKeyDisabled => {
+                (StatusCode::UNAUTHORIZED, "API key is disabled".to_string())
+            }
+            AuthError::ApiKeyExpired => {
+                (StatusCode::UNAUTHORIZED, "API key has expired".to_string())
+            }
+            AuthError::TenantSuspended => (
+                StatusCode::FORBIDDEN,
+                "Tenant account is suspended".to_string(),
+            ),
             AuthError::JwtNotConfigured => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "JWT authentication not configured".to_string(),
