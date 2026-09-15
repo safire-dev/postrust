@@ -37,9 +37,9 @@ pub mod schema_cache;
 
 // Re-export main types
 pub use api_request::{
-    parse_request, Action, ApiRequest, DbAction, Filter, LogicTree, MediaType,
-    Mutation, Operation, Payload, Preferences, PreferRepresentation, QualifiedIdentifier,
-    QueryParams, Range, Resource, SelectItem,
+    parse_request, Action, ApiRequest, DbAction, Filter, LogicTree, MediaType, Mutation, Operation,
+    Payload, PreferRepresentation, Preferences, QualifiedIdentifier, QueryParams, Range, Resource,
+    SelectItem,
 };
 pub use config::{AppConfig, IsolationLevel, LogLevel};
 pub use error::{Error, Result};
@@ -49,8 +49,8 @@ pub use schema_cache::{Column, Relationship, Routine, SchemaCache, SchemaCacheRe
 /// Prelude for common imports.
 pub mod prelude {
     pub use super::api_request::{
-        parse_request, Action, ApiRequest, Filter, MediaType, Preferences,
-        QualifiedIdentifier, QueryParams, Range, SelectItem,
+        parse_request, Action, ApiRequest, Filter, MediaType, Preferences, QualifiedIdentifier,
+        QueryParams, Range, SelectItem,
     };
     pub use super::config::AppConfig;
     pub use super::error::{Error, Result};

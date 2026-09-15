@@ -71,8 +71,7 @@ async fn main() -> Result<()> {
         .route("/{*path}", any(handle_request));
 
     // Build main router
-    let mut app: Router<Arc<AppState>> = Router::new()
-        .nest("/api", api_router);
+    let mut app: Router<Arc<AppState>> = Router::new().nest("/api", api_router);
 
     // Add custom routes (health checks, webhooks, etc.)
     app = app.nest("/_", custom::custom_router());
@@ -102,12 +101,8 @@ async fn main() -> Result<()> {
             ..SchemaConfig::default()
         };
         let graphql_state = Arc::new(
-            GraphQLState::new(
-                state.pool.clone(),
-                schema_cache_arc.clone(),
-                graphql_config,
-            )
-            .expect("Failed to build GraphQL schema"),
+            GraphQLState::new(state.pool.clone(), schema_cache_arc.clone(), graphql_config)
+                .expect("Failed to build GraphQL schema"),
         );
 
         // Initialize subscription broker
@@ -138,26 +133,32 @@ async fn main() -> Result<()> {
             req: GqlRequest,
         ) -> GqlResponse {
             // Extract auth header and authenticate
-            let auth_header = headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok());
+            let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
-            let auth_result = match postrust_auth::authenticate(auth_header, &app_state.jwt_config) {
+            let auth_result = match postrust_auth::authenticate(auth_header, &app_state.jwt_config)
+            {
                 Ok(auth) => auth,
                 Err(e) => {
                     tracing::debug!("GraphQL auth failed: {}, using anon role", e);
                     postrust_auth::AuthResult {
-                        role: app_state.jwt_config.anon_role.clone().unwrap_or_else(|| "anon".to_string()),
+                        role: app_state
+                            .jwt_config
+                            .anon_role
+                            .clone()
+                            .unwrap_or_else(|| "anon".to_string()),
                         claims: std::collections::HashMap::new(),
                     }
                 }
             };
 
-            tracing::debug!("GraphQL request authenticated as role: {}", auth_result.role);
+            tracing::debug!(
+                "GraphQL request authenticated as role: {}",
+                auth_result.role
+            );
 
             // Create SchemaCacheRef from the static Arc<SchemaCache>
             let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
-                (*app_state.gql_state.schema_cache).clone()
+                (*app_state.gql_state.schema_cache).clone(),
             );
 
             let gql_ctx = postrust_graphql::context::GraphQLContext::new(
@@ -189,17 +190,20 @@ async fn main() -> Result<()> {
     }
 
     // Add root info endpoint
-    app = app.route("/", axum::routing::get(|| async {
-        Json(serde_json::json!({
-            "name": "postrust",
-            "version": env!("CARGO_PKG_VERSION"),
-            "api": "/api",
-            "custom": "/_",
-            "health": "/_/health",
-            "admin": "/admin",
-            "docs": "/admin/swagger"
-        }))
-    }));
+    app = app.route(
+        "/",
+        axum::routing::get(|| async {
+            Json(serde_json::json!({
+                "name": "postrust",
+                "version": env!("CARGO_PKG_VERSION"),
+                "api": "/api",
+                "custom": "/_",
+                "health": "/_/health",
+                "admin": "/admin",
+                "docs": "/admin/swagger"
+            }))
+        }),
+    );
 
     // Apply CORS and state
     let app = app

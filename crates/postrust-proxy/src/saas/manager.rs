@@ -37,7 +37,7 @@ impl DomainManager {
         req: CreateDomainRequest,
     ) -> ProxyResult<DomainResponse> {
         // Validate domain format
-        self.validate_domain_format(&req.domain)?;
+        validate_domain_format(&req.domain)?;
 
         // Check tenant quota
         let (current, max) = db::check_domain_quota(&self.pool, tenant_id).await?;
@@ -57,7 +57,8 @@ impl DomainManager {
         let verification_token = generate_verification_token();
 
         // Create domain
-        let domain = db::create_domain(&self.pool, tenant_id, req.clone(), &verification_token).await?;
+        let domain =
+            db::create_domain(&self.pool, tenant_id, req.clone(), &verification_token).await?;
 
         // Create verification challenge
         let expected_value = format!("postrust-verify={}", verification_token);
@@ -76,8 +77,12 @@ impl DomainManager {
 
         // Generate verification instructions
         let instructions = match domain.verification_method {
-            VerificationMethod::Dns => VerificationInstructions::dns(&domain.domain, &verification_token),
-            VerificationMethod::Http => VerificationInstructions::http(&domain.domain, &verification_token),
+            VerificationMethod::Dns => {
+                VerificationInstructions::dns(&domain.domain, &verification_token)
+            }
+            VerificationMethod::Http => {
+                VerificationInstructions::http(&domain.domain, &verification_token)
+            }
         };
 
         Ok(DomainResponse {
@@ -121,7 +126,11 @@ impl DomainManager {
     }
 
     /// Verify a domain.
-    pub async fn verify_domain(&self, id: Uuid, tenant_id: Uuid) -> ProxyResult<VerificationResult> {
+    pub async fn verify_domain(
+        &self,
+        id: Uuid,
+        tenant_id: Uuid,
+    ) -> ProxyResult<VerificationResult> {
         let domain = db::get_domain_for_tenant(&self.pool, id, tenant_id)
             .await?
             .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
@@ -146,7 +155,8 @@ impl DomainManager {
         match &result {
             VerificationResult::Verified => {
                 // Update domain status
-                db::update_verification_status(&self.pool, id, VerificationStatus::Verified).await?;
+                db::update_verification_status(&self.pool, id, VerificationStatus::Verified)
+                    .await?;
 
                 // If ACME is enabled, trigger SSL provisioning
                 if domain.ssl_provider == SslProvider::Acme {
@@ -335,47 +345,49 @@ impl DomainManager {
     // =========================================================================
     // Validation Helpers
     // =========================================================================
+}
 
-    /// Validate domain format.
-    fn validate_domain_format(&self, domain: &str) -> ProxyResult<()> {
-        // Check length
-        if domain.is_empty() || domain.len() > 253 {
-            return Err(ProxyError::Validation("Invalid domain length".into()));
+/// Validate domain format.
+fn validate_domain_format(domain: &str) -> ProxyResult<()> {
+    // Check length
+    if domain.is_empty() || domain.len() > 253 {
+        return Err(ProxyError::Validation("Invalid domain length".into()));
+    }
+
+    // Must have at least one dot
+    if !domain.contains('.') {
+        return Err(ProxyError::Validation(
+            "Domain must have at least one dot".into(),
+        ));
+    }
+
+    // Check each label
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ProxyError::Validation("Invalid domain label length".into()));
         }
 
-        // Must have at least one dot
-        if !domain.contains('.') {
-            return Err(ProxyError::Validation("Domain must have at least one dot".into()));
+        // Check first and last characters
+        let chars: Vec<char> = label.chars().collect();
+        if chars.first().map_or(true, |c| !c.is_alphanumeric())
+            || chars.last().map_or(true, |c| !c.is_alphanumeric())
+        {
+            return Err(ProxyError::Validation(
+                "Domain labels must start and end with alphanumeric characters".into(),
+            ));
         }
 
-        // Check each label
-        for label in domain.split('.') {
-            if label.is_empty() || label.len() > 63 {
-                return Err(ProxyError::Validation("Invalid domain label length".into()));
-            }
-
-            // Check first and last characters
-            let chars: Vec<char> = label.chars().collect();
-            if chars.first().map_or(true, |c| !c.is_alphanumeric())
-                || chars.last().map_or(true, |c| !c.is_alphanumeric())
-            {
+        // Check all characters
+        for c in label.chars() {
+            if !c.is_alphanumeric() && c != '-' {
                 return Err(ProxyError::Validation(
-                    "Domain labels must start and end with alphanumeric characters".into(),
+                    "Domain labels can only contain alphanumeric characters and hyphens".into(),
                 ));
             }
-
-            // Check all characters
-            for c in label.chars() {
-                if !c.is_alphanumeric() && c != '-' {
-                    return Err(ProxyError::Validation(
-                        "Domain labels can only contain alphanumeric characters and hyphens".into(),
-                    ));
-                }
-            }
         }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 /// Generate a secure verification token.
@@ -395,18 +407,22 @@ fn generate_verification_token() -> String {
 mod tests {
     use super::*;
 
-    // Helper to create a test manager would require a mock pool
-    // For now, just test the validation logic
-
     #[test]
     fn test_validate_domain_format_valid() {
-        let manager = DomainManager {
-            pool: unsafe { std::mem::zeroed() }, // Not used in validation
-            verification_service: Arc::new(unsafe { std::mem::zeroed() }),
-        };
+        assert!(validate_domain_format("example.com").is_ok());
+        assert!(validate_domain_format("sub.example.com").is_ok());
+        assert!(validate_domain_format("example-domain.com").is_ok());
+    }
 
-        // These would panic with zeroed pool, so we can't actually run them
-        // In a real test, you'd use a mock pool
+    #[test]
+    fn test_validate_domain_format_invalid() {
+        assert!(validate_domain_format("").is_err());
+        assert!(validate_domain_format("localhost").is_err());
+        assert!(validate_domain_format(".example.com").is_err());
+        assert!(validate_domain_format("example.com.").is_err());
+        assert!(validate_domain_format("-example.com").is_err());
+        assert!(validate_domain_format("example-.com").is_err());
+        assert!(validate_domain_format("example!.com").is_err());
     }
 
     #[test]

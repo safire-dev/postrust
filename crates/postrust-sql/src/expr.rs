@@ -24,11 +24,7 @@ impl Expr {
     /// Create a qualified column reference (table.column).
     pub fn qualified_column(table: &str, column: &str) -> Self {
         Self {
-            fragment: SqlFragment::raw(format!(
-                "{}.{}",
-                escape_ident(table),
-                escape_ident(column)
-            )),
+            fragment: SqlFragment::raw(format!("{}.{}", escape_ident(table), escape_ident(column))),
         }
     }
 

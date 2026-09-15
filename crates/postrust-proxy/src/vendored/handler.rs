@@ -6,7 +6,7 @@
 //! - Request parsing
 
 use crate::config::Route;
-use crate::vendored::hyper_ext::{ProxyBody, empty_body, string_body};
+use crate::vendored::hyper_ext::{empty_body, string_body, ProxyBody};
 use hyper::header::{HeaderName, HeaderValue, HOST};
 use hyper::{Request, Response, StatusCode};
 use std::net::SocketAddr;
@@ -177,10 +177,7 @@ mod tests {
 
     #[test]
     fn test_strip_path_prefix_root() {
-        let mut request = Request::builder()
-            .uri("/api")
-            .body(empty_body())
-            .unwrap();
+        let mut request = Request::builder().uri("/api").body(empty_body()).unwrap();
 
         MessageHandler::strip_path_prefix(&mut request, "/api");
 
@@ -202,10 +199,7 @@ mod tests {
             request.headers().get("x-forwarded-for").unwrap(),
             "192.168.1.100"
         );
-        assert_eq!(
-            request.headers().get("x-forwarded-proto").unwrap(),
-            "https"
-        );
+        assert_eq!(request.headers().get("x-forwarded-proto").unwrap(), "https");
         assert_eq!(
             request.headers().get("x-forwarded-host").unwrap(),
             "example.com"

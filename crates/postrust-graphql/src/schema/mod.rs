@@ -149,7 +149,9 @@ impl GeneratedSchema {
 
     /// Get query fields for a table.
     pub fn get_query_field(&self, table_name: &str) -> Option<&QueryField> {
-        self.query_fields.iter().find(|f| f.table_name == table_name)
+        self.query_fields
+            .iter()
+            .find(|f| f.table_name == table_name)
     }
 
     /// Get mutation fields for a table.
@@ -167,7 +169,10 @@ impl GeneratedSchema {
 
     /// Get all table names.
     pub fn table_names(&self) -> Vec<&str> {
-        self.object_types.values().map(|t| t.table.name.as_str()).collect()
+        self.object_types
+            .values()
+            .map(|t| t.table.name.as_str())
+            .collect()
     }
 
     /// Get all type names.
@@ -309,11 +314,7 @@ fn graphql_id_scalar_for_column(col: &Column) -> &'static str {
         "UUID"
     } else if t == "bigint" || t == "int8" {
         "String"
-    } else if t == "text"
-        || t == "character varying"
-        || t == "bpchar"
-        || t == "name"
-    {
+    } else if t == "text" || t == "character varying" || t == "bpchar" || t == "name" {
         "String"
     } else {
         "String"
@@ -669,8 +670,8 @@ mod tests {
 
     #[test]
     fn test_schema_config_with_schemas() {
-        let config = SchemaConfig::new()
-            .with_schemas(vec!["api".to_string(), "public".to_string()]);
+        let config =
+            SchemaConfig::new().with_schemas(vec!["api".to_string(), "public".to_string()]);
         assert!(config.is_schema_exposed("api"));
         assert!(config.is_schema_exposed("public"));
         assert!(!config.is_schema_exposed("private"));
@@ -923,7 +924,11 @@ mod tests {
         assert!(users_field.is_list);
 
         // Check count field
-        let count_field = schema.query_fields.iter().find(|f| f.name == "usersCount").unwrap();
+        let count_field = schema
+            .query_fields
+            .iter()
+            .find(|f| f.name == "usersCount")
+            .unwrap();
         assert!(count_field.is_count);
         assert_eq!(count_field.return_type, "Int!");
     }
@@ -995,7 +1000,9 @@ mod tests {
             pk_cols: vec!["id".into()],
             columns: indexmap::IndexMap::new(),
         };
-        cache.tables.insert(private_table.qualified_identifier(), private_table);
+        cache
+            .tables
+            .insert(private_table.qualified_identifier(), private_table);
 
         let config = SchemaConfig::default(); // Only exposes "public"
         let schema = build_schema(&cache, &config);

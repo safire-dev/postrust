@@ -102,12 +102,12 @@ pub fn pg_type_to_graphql(pg_type: &str) -> GraphQLType {
         "uuid" => GraphQLType::Uuid,
 
         // Date/Time types
-        "timestamp" | "timestamp without time zone" | "timestamptz"
+        "timestamp"
+        | "timestamp without time zone"
+        | "timestamptz"
         | "timestamp with time zone" => GraphQLType::DateTime,
         "date" => GraphQLType::Date,
-        "time" | "time without time zone" | "timetz" | "time with time zone" => {
-            GraphQLType::Time
-        }
+        "time" | "time without time zone" | "timetz" | "time with time zone" => GraphQLType::Time,
 
         // Default to String for unknown types
         _ => GraphQLType::String,
@@ -206,10 +206,7 @@ mod tests {
     fn test_pg_to_graphql_time() {
         assert_eq!(pg_type_to_graphql("time"), GraphQLType::Time);
         assert_eq!(pg_type_to_graphql("timetz"), GraphQLType::Time);
-        assert_eq!(
-            pg_type_to_graphql("time with time zone"),
-            GraphQLType::Time
-        );
+        assert_eq!(pg_type_to_graphql("time with time zone"), GraphQLType::Time);
     }
 
     #[test]

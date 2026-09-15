@@ -321,23 +321,21 @@ pub async fn update_ssl_status(
 }
 
 pub async fn enable_domain(pool: &PgPool, id: Uuid) -> ProxyResult<bool> {
-    let result = sqlx::query(
-        "UPDATE proxy_domains SET enabled = true, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE proxy_domains SET enabled = true, updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await?;
 
     Ok(result.rows_affected() > 0)
 }
 
 pub async fn disable_domain(pool: &PgPool, id: Uuid) -> ProxyResult<bool> {
-    let result = sqlx::query(
-        "UPDATE proxy_domains SET enabled = false, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE proxy_domains SET enabled = false, updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await?;
 
     Ok(result.rows_affected() > 0)
 }
@@ -553,7 +551,10 @@ pub async fn update_route(
     .bind(serde_json::to_value(req.add_headers.unwrap_or(existing.add_headers)).unwrap_or_default())
     .bind(req.remove_headers.unwrap_or(existing.remove_headers))
     .bind(req.rate_limit_requests.or(existing.rate_limit_requests))
-    .bind(req.rate_limit_window_secs.or(existing.rate_limit_window_secs))
+    .bind(
+        req.rate_limit_window_secs
+            .or(existing.rate_limit_window_secs),
+    )
     .bind(req.timeout_secs.unwrap_or(existing.timeout_secs))
     .bind(req.enabled.unwrap_or(existing.enabled))
     .fetch_one(pool)
@@ -756,7 +757,10 @@ pub async fn update_upstream(
             .map(lb_strategy_str)
             .unwrap_or_else(|| lb_strategy_str(&existing.lb_strategy)),
     )
-    .bind(req.health_check_enabled.unwrap_or(existing.health_check_enabled))
+    .bind(
+        req.health_check_enabled
+            .unwrap_or(existing.health_check_enabled),
+    )
     .bind(req.health_check_path.unwrap_or(existing.health_check_path))
     .bind(
         req.health_check_interval_secs
@@ -767,7 +771,10 @@ pub async fn update_upstream(
             .unwrap_or(existing.health_check_timeout_secs),
     )
     .bind(req.healthy_threshold.unwrap_or(existing.healthy_threshold))
-    .bind(req.unhealthy_threshold.unwrap_or(existing.unhealthy_threshold))
+    .bind(
+        req.unhealthy_threshold
+            .unwrap_or(existing.unhealthy_threshold),
+    )
     .bind(req.enabled.unwrap_or(existing.enabled))
     .fetch_one(pool)
     .await?;
@@ -834,7 +841,10 @@ pub async fn delete_backend(
     Ok(result.rows_affected() > 0)
 }
 
-async fn list_backends_for_upstream(pool: &PgPool, upstream_id: Uuid) -> ProxyResult<Vec<DomainBackend>> {
+async fn list_backends_for_upstream(
+    pool: &PgPool,
+    upstream_id: Uuid,
+) -> ProxyResult<Vec<DomainBackend>> {
     sqlx::query_as::<_, DomainBackend>(
         r#"
         SELECT id, upstream_id, address, scheme, weight, enabled, created_at
@@ -988,36 +998,33 @@ pub async fn delete_api_key(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyRe
 }
 
 pub async fn disable_api_key(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
-    let result = sqlx::query(
-        "UPDATE proxy_api_keys SET enabled = false WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(id)
-    .bind(tenant_id)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE proxy_api_keys SET enabled = false WHERE id = $1 AND tenant_id = $2")
+            .bind(id)
+            .bind(tenant_id)
+            .execute(pool)
+            .await?;
 
     Ok(result.rows_affected() > 0)
 }
 
 pub async fn enable_api_key(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
-    let result = sqlx::query(
-        "UPDATE proxy_api_keys SET enabled = true WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(id)
-    .bind(tenant_id)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE proxy_api_keys SET enabled = true WHERE id = $1 AND tenant_id = $2")
+            .bind(id)
+            .bind(tenant_id)
+            .execute(pool)
+            .await?;
 
     Ok(result.rows_affected() > 0)
 }
 
 pub async fn is_tenant_active(pool: &PgPool, tenant_id: Uuid) -> ProxyResult<bool> {
-    let status = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT status FROM proxy_tenants WHERE id = $1",
-    )
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await?;
+    let status =
+        sqlx::query_scalar::<_, Option<String>>("SELECT status FROM proxy_tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_one(pool)
+            .await?;
 
     Ok(matches!(status.as_deref(), Some("active")))
 }

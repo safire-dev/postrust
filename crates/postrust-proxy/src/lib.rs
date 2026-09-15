@@ -50,7 +50,7 @@ mod error;
 pub use error::{ProxyError, ProxyResult};
 
 // Re-export key types for convenience
-pub use config::{ProxyConfig, Route, Upstream, Backend};
+pub use config::{Backend, ProxyConfig, Route, Upstream};
 pub use health::HealthChecker;
 pub use ratelimit::RateLimiter;
 

@@ -157,12 +157,14 @@ impl CertificateStore {
             .fetch_optional(&self.pool)
             .await?;
 
-        Ok(row.map(|(domain, cert_pem, key_pem, expires_at)| Certificate {
-            domain,
-            cert_pem,
-            key_pem,
-            expires_at,
-        }))
+        Ok(
+            row.map(|(domain, cert_pem, key_pem, expires_at)| Certificate {
+                domain,
+                cert_pem,
+                key_pem,
+                expires_at,
+            }),
+        )
     }
 
     async fn save_to_database(&self, cert: &Certificate) -> ProxyResult<()> {

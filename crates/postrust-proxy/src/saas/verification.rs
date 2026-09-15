@@ -224,9 +224,26 @@ impl Default for DomainVerificationService {
 mod tests {
     use super::*;
 
+    fn test_service() -> DomainVerificationService {
+        DomainVerificationService {
+            dns_resolver: TokioAsyncResolver::tokio(
+                ResolverConfig::default(),
+                ResolverOpts::default(),
+            ),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::limited(3))
+                .user_agent("PostrustProxy/1.0 DomainVerification")
+                .build()
+                .expect("Failed to create test HTTP client"),
+        }
+    }
+
     #[tokio::test]
     async fn test_dns_verification_not_found() {
-        let service = DomainVerificationService::new();
+        let service = test_service();
 
         // Use a domain that definitely won't have our verification record
         let result = service
@@ -243,12 +260,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_verification_not_found() {
-        let service = DomainVerificationService::new();
+        let service = test_service();
 
         // Use a domain that won't have our verification file
-        let result = service
-            .verify_http("example.com", "testtoken123")
-            .await;
+        let result = service.verify_http("example.com", "testtoken123").await;
 
         match result {
             VerificationResult::Failed { .. } => {
