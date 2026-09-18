@@ -2274,8 +2274,8 @@ async fn a_permission_may_consult_a_table_the_role_cannot_read() {
 /// Verified JWT claims must reach the same transaction as the GraphQL query.
 ///
 /// Role switching alone is insufficient for policies that distinguish users
-/// sharing one database role. The complete claims document is also scoped to
-/// the transaction so a pooled connection cannot retain the prior identity.
+/// sharing one database role. Individual claim settings are scoped to the
+/// transaction so a pooled connection cannot retain the prior identity.
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn verified_jwt_claims_are_available_to_graphql_rls_without_leaking() {
@@ -2308,8 +2308,8 @@ async fn verified_jwt_claims_are_available_to_graphql_rls_without_leaking() {
                  FOR SELECT TO {reader_role}
                  USING (
                      owner_id = NULLIF(
-                         current_setting('request.jwt.claims', true), ''
-                     )::jsonb ->> 'user_id'
+                         current_setting('request.jwt.claims.user_id', true), ''
+                     )
                  );
              GRANT USAGE ON SCHEMA {schema} TO {reader_role};
              GRANT SELECT ON {schema}.documents TO {reader_role};"
