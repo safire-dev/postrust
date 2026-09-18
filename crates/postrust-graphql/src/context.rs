@@ -181,24 +181,11 @@ impl GraphQLContext {
     /// The transaction-local settings this request's identity needs.
     ///
     /// Hasura session variables retain their existing representation, while
-    /// the complete verified JWT is also exposed through
-    /// `request.jwt.claims`, matching the REST path.
+    /// the verified JWT is exposed as both `request.jwt.claims` JSON and
+    /// individual `request.jwt.claims.<name>` settings.
     pub fn session_settings(&self) -> Vec<(String, String)> {
         let mut settings = session_settings_for(&self.session, self.acting_role());
-        let mut claims: serde_json::Map<String, serde_json::Value> = self
-            .auth
-            .claims
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        claims.insert(
-            "role".to_string(),
-            serde_json::Value::String(self.auth.role.clone()),
-        );
-        settings.push((
-            "request.jwt.claims".to_string(),
-            serde_json::Value::Object(claims).to_string(),
-        ));
+        settings.extend(self.auth.claim_settings());
         settings
     }
 
@@ -315,6 +302,14 @@ mod tests {
 
         assert_eq!(claims["user_id"], serde_json::json!(123));
         assert_eq!(claims["role"], serde_json::json!("authenticated"));
+        assert_eq!(
+            setting(&settings, "request.jwt.claims.user_id"),
+            Some("123")
+        );
+        assert_eq!(
+            setting(&settings, "request.jwt.claims.role"),
+            Some("authenticated")
+        );
     }
 
     #[test]
