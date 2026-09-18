@@ -178,14 +178,28 @@ impl GraphQLContext {
         self
     }
 
-    /// The `SET LOCAL` statements this request's session variables need.
+    /// The transaction-local settings this request's identity needs.
     ///
-    /// The setting name is built from the variable's own name after it has
-    /// been checked, and the value is bound rather than interpolated:
-    /// `set_config` takes both as arguments, where `SET LOCAL` would need the
-    /// value written into the statement.
+    /// Hasura session variables retain their existing representation, while
+    /// the complete verified JWT is also exposed through
+    /// `request.jwt.claims`, matching the REST path.
     pub fn session_settings(&self) -> Vec<(String, String)> {
-        session_settings_for(&self.session, self.acting_role())
+        let mut settings = session_settings_for(&self.session, self.acting_role());
+        let mut claims: serde_json::Map<String, serde_json::Value> = self
+            .auth
+            .claims
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        claims.insert(
+            "role".to_string(),
+            serde_json::Value::String(self.auth.role.clone()),
+        );
+        settings.push((
+            "request.jwt.claims".to_string(),
+            serde_json::Value::Object(claims).to_string(),
+        ));
+        settings
     }
 
     /// The session as a function reading `hasura_session` expects it.
@@ -285,6 +299,22 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_str(setting(&settings, "hasura.session").unwrap()).unwrap();
         assert_eq!(document["x-hasura-role"], serde_json::json!("Artist"));
+    }
+
+    #[tokio::test]
+    async fn graphql_transactions_receive_the_verified_jwt_claims_document() {
+        let ctx = GraphQLContext::new(
+            PgPool::connect_lazy("postgres://localhost/test").expect("valid test URL"),
+            SchemaCacheRef::default(),
+            create_test_auth(),
+        );
+
+        let settings = ctx.session_settings();
+        let claims: serde_json::Value =
+            serde_json::from_str(setting(&settings, "request.jwt.claims").unwrap()).unwrap();
+
+        assert_eq!(claims["user_id"], serde_json::json!(123));
+        assert_eq!(claims["role"], serde_json::json!("authenticated"));
     }
 
     #[test]
