@@ -1614,6 +1614,7 @@ fn create_object_type(
     federation_entity: Option<&FederationEntity>,
 ) -> Object {
     let mut object = Object::new(&obj.name);
+    let entity_is_shared = federation_entity.is_some_and(|entity| entity.shared);
     if let Some(entity) = federation_entity {
         object = object.key(entity.key_fields_sdl());
     }
@@ -1727,7 +1728,7 @@ fn create_object_type(
         } else {
             gql_field
         };
-        let gql_field = if federation_entity.is_some_and(|entity| entity.shared && !field.is_pk) {
+        let gql_field = if entity_is_shared && !field.is_pk {
             gql_field.shareable()
         } else {
             gql_field
@@ -1824,6 +1825,11 @@ fn create_object_type(
         } else {
             gql_field
         };
+        let gql_field = if entity_is_shared {
+            gql_field.shareable()
+        } else {
+            gql_field
+        };
 
         fields.push((rel.name.clone(), gql_field));
 
@@ -1892,6 +1898,11 @@ fn create_object_type(
                             TypeRef::named_nn(computed_args_type_name(&obj.local_name, &rel.name)),
                         )),
                     ));
+                }
+                if entity_is_shared {
+                    let last = fields.len() - 1;
+                    let (name, field) = fields.remove(last);
+                    fields.push((name, field.shareable()));
                 }
             }
         }
@@ -9655,7 +9666,8 @@ fn json_to_value(json: serde_json::Value) -> Value {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use postrust_core::schema_cache::{Column, Table};
+    use postrust_core::schema_cache::{Cardinality, Column, Relationship, Table};
+    use postrust_core::QualifiedIdentifier;
     use std::collections::{HashMap, HashSet};
 
     fn entity_key_column(pg_type: &str, explicit_id: bool) -> EntityKeyColumn {
@@ -9794,6 +9806,25 @@ mod tests {
     fn add_test_table(cache: &mut SchemaCache, name: &str) {
         let table = create_test_table(name);
         cache.tables.insert(table.qualified_identifier(), table);
+    }
+
+    fn add_test_posts_relationship(cache: &mut SchemaCache) {
+        let users = QualifiedIdentifier::new("public", "users");
+        cache.relationships.insert(
+            (users.clone(), "public".into()),
+            vec![Relationship::ForeignKey {
+                table: users,
+                foreign_table: QualifiedIdentifier::new("public", "posts"),
+                is_self: false,
+                cardinality: Cardinality::O2M {
+                    constraint: "posts_user_id_fkey".into(),
+                    columns: vec![("id".into(), "user_id".into())],
+                },
+                table_is_view: false,
+                foreign_table_is_view: false,
+                constraint_name: "posts_user_id_fkey".into(),
+            }],
+        );
     }
 
     // ============================================================================
@@ -10077,6 +10108,68 @@ mod tests {
         assert!(
             !with_disabled_federation_metadata.contains("@key"),
             "federation key:\n{with_disabled_federation_metadata}"
+        );
+    }
+
+    #[test]
+    fn shared_entities_make_relationship_fields_shareable() {
+        let federation_sdl = |shared: bool| {
+            let mut cache = create_test_schema_cache();
+            add_test_table(&mut cache, "posts");
+            add_test_posts_relationship(&mut cache);
+            let names = match shared {
+                true => crate::names::NameOverrides::parse(
+                    r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+                )
+                .expect("metadata"),
+                false => crate::names::NameOverrides::default(),
+            };
+            let config = SchemaConfig {
+                enable_federation: true,
+                type_prefix: Some("test".into()),
+                names: names.clone(),
+                ..SchemaConfig::default()
+            };
+            let generated = build_schema(&cache, &config);
+            build_dynamic_schema(
+                &generated,
+                &cache,
+                None,
+                None,
+                Arc::new(names),
+                std::time::Duration::from_secs(30),
+                None,
+            )
+            .expect("federated schema should build")
+            .sdl_with_options(async_graphql::SDLExportOptions::new().federation())
+        };
+
+        let shared = federation_sdl(true);
+        assert!(
+            shared.contains("): [test_posts!]! @shareable"),
+            "shared relationship field:\n{shared}"
+        );
+        assert!(
+            shared.contains("): test_posts_aggregate! @shareable"),
+            "shared relationship aggregate field:\n{shared}"
+        );
+
+        let not_shared = federation_sdl(false);
+        assert!(
+            not_shared.contains("): [test_posts!]!"),
+            "non-shared relationship field:\n{not_shared}"
+        );
+        assert!(
+            !not_shared.contains("): [test_posts!]! @shareable"),
+            "non-shared relationship field must not be shareable:\n{not_shared}"
+        );
+        assert!(
+            not_shared.contains("): test_posts_aggregate!"),
+            "non-shared relationship aggregate field:\n{not_shared}"
+        );
+        assert!(
+            !not_shared.contains("): test_posts_aggregate! @shareable"),
+            "non-shared relationship aggregate must not be shareable:\n{not_shared}"
         );
     }
 
