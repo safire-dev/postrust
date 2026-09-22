@@ -449,6 +449,104 @@ async fn federation_entities_resolve_shared_rows_by_key() {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
+async fn federation_integer_keys_reject_string_representations_before_querying() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedkeytype");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "widgets");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let errors = execute_err(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [{__typename: "widgets", id: "2"}]) {
+            ... on widgets { id name }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    assert!(
+        errors.contains(
+            "invalid key field \"id\": expected a value compatible with PostgreSQL type \"int4\", found a string"
+        ),
+        "unexpected error: {}",
+        errors
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_integer_backed_ids_reuse_prepared_statements_across_both_input_forms() {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url())
+        .await
+        .expect("failed to connect to test database");
+    let schema = unique_schema_name("fedidnormalize");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{"{schema}.widgets": {{
+            "column_types": {{"id": "ID"}},
+            "federation": {{"shared": true}}
+        }}}}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+
+    for id in ["2", "\"2\"", "2"] {
+        let query = format!(
+            r#"{{
+              _entities(representations: [{{__typename: "widgets", id: {id}}}]) {{
+                ... on widgets {{ id name }}
+              }}
+            }}"#
+        );
+        let data = execute_ok(&state, &pool, &schema, &query).await;
+        let entity = data
+            .get("_entities")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .expect("resolved entity");
+        assert_eq!(
+            entity.get("name").and_then(|value| value.as_str()),
+            Some("bravo")
+        );
+    }
+
+    // A different projection produces a fresh prepared statement. Start this
+    // one with the string spelling so the opposite cache order is covered.
+    for id in ["\"3\"", "3"] {
+        let query = format!(
+            r#"{{
+              _entities(representations: [{{__typename: "widgets", id: {id}}}]) {{
+                ... on widgets {{ id category }}
+              }}
+            }}"#
+        );
+        let data = execute_ok(&state, &pool, &schema, &query).await;
+        let entity = data
+            .get("_entities")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .expect("resolved entity");
+        assert_eq!(
+            entity.get("category").and_then(|value| value.as_str()),
+            Some("books")
+        );
+    }
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
 async fn federation_entities_reject_missing_rows() {
     let pool = connect().await;
     let schema = unique_schema_name("fedmissing");

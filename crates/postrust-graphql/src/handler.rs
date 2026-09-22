@@ -2724,6 +2724,7 @@ struct EntityKeyColumn {
     field_name: String,
     column_name: String,
     pg_type: String,
+    explicit_id: bool,
 }
 
 /// The federation entity resolver's immutable schema view.
@@ -2758,6 +2759,10 @@ impl EntityResolverState {
                     field_name: field_name.clone(),
                     column_name: column.name.clone(),
                     pg_type: column.nominal_type.clone(),
+                    explicit_id: matches!(
+                        names.column_type(&object.table.schema, &object.table.name, &column.name),
+                        Some(crate::types::GraphQLType::Id)
+                    ),
                 });
             }
             if key_columns.len() != entity.key_fields.len() {
@@ -2829,7 +2834,11 @@ async fn resolve_entities<'a>(
         })?;
         let rows = resolve_entity_group(ctx, lookup, &representations, state).await?;
         for representation in representations {
-            let key = entity_key(&representation.values, &lookup.key_columns)?;
+            let (key, _) = normalized_entity_key(
+                &representation.values,
+                &lookup.key_columns,
+                &lookup.type_name,
+            )?;
             let row = rows.get(&key).ok_or_else(|| {
                 async_graphql::Error::new(format!(
                     "entity \"{}\" could not be resolved from its key",
@@ -2862,17 +2871,13 @@ async fn resolve_entity_group(
     let mut bound_values = Vec::new();
     let mut disjuncts = Vec::with_capacity(representations.len());
     for representation in representations {
+        let (_, normalized_values) = normalized_entity_key(
+            &representation.values,
+            &lookup.key_columns,
+            &lookup.type_name,
+        )?;
         let mut conjuncts = Vec::with_capacity(lookup.key_columns.len());
-        for key_column in &lookup.key_columns {
-            let value = representation
-                .values
-                .get(&key_column.field_name)
-                .ok_or_else(|| {
-                    async_graphql::Error::new(format!(
-                        "entity representation for \"{}\" is missing key field \"{}\"",
-                        lookup.type_name, key_column.field_name
-                    ))
-                })?;
+        for (key_column, value) in lookup.key_columns.iter().zip(normalized_values) {
             conjuncts.push(format!(
                 "{}.{} = ${}::{}",
                 postrust_sql::escape_ident(READ_ROW),
@@ -2880,7 +2885,7 @@ async fn resolve_entity_group(
                 bound_values.len() + 1,
                 key_column.pg_type
             ));
-            bound_values.push(value.clone());
+            bound_values.push(value);
         }
         disjuncts.push(format!("({})", conjuncts.join(" AND ")));
     }
@@ -3016,27 +3021,157 @@ async fn resolve_entity_group(
         let serde_json::Value::Object(values) = &row else {
             continue;
         };
-        by_key.insert(entity_key(values, &lookup.key_columns)?, row);
+        let (key, _) = normalized_entity_key(values, &lookup.key_columns, &lookup.type_name)?;
+        by_key.insert(key, row);
     }
     Ok(by_key)
 }
 
-fn entity_key(
+/// Validate an entity key and normalize explicit GraphQL `ID` overrides to
+/// their integer, text or UUID storage type. `_Any` deliberately skips the
+/// field-level checks ordinary GraphQL arguments receive.
+fn normalized_entity_key(
     values: &serde_json::Map<String, serde_json::Value>,
     key_columns: &[EntityKeyColumn],
-) -> Result<String, async_graphql::Error> {
+    type_name: &str,
+) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
     let mut key = Vec::with_capacity(key_columns.len());
     for key_column in key_columns {
         let value = values.get(&key_column.field_name).ok_or_else(|| {
             async_graphql::Error::new(format!(
-                "entity row is missing key field \"{}\"",
-                key_column.field_name
+                "entity representation for \"{}\" is missing key field \"{}\"",
+                type_name, key_column.field_name
             ))
         })?;
-        key.push(value.clone());
+        key.push(normalize_entity_key_value(type_name, key_column, value)?);
     }
-    serde_json::to_string(&key)
-        .map_err(|e| async_graphql::Error::new(format!("entity key could not be encoded: {e}")))
+    let encoded = serde_json::to_string(&key)
+        .map_err(|e| async_graphql::Error::new(format!("entity key could not be encoded: {e}")))?;
+    Ok((encoded, key))
+}
+
+fn normalize_entity_key_value(
+    type_name: &str,
+    key_column: &EntityKeyColumn,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, async_graphql::Error> {
+    let invalid = |expected: &str| {
+        async_graphql::Error::new(format!(
+            "entity representation for \"{}\" has invalid key field \"{}\": expected {}, found {}",
+            type_name,
+            key_column.field_name,
+            expected,
+            json_value_kind(value)
+        ))
+    };
+
+    if key_column.explicit_id {
+        return normalize_graphql_id(value, &key_column.pg_type).ok_or_else(|| {
+            invalid(&format!(
+                "an ID compatible with PostgreSQL type \"{}\"",
+                key_column.pg_type
+            ))
+        });
+    }
+
+    let pg_type = key_column.pg_type.trim().to_ascii_lowercase();
+    let normalized = if integer_bounds(&pg_type).is_some() {
+        value.as_i64().and_then(|integer| {
+            let (min, max) = integer_bounds(&pg_type)?;
+            (min..=max)
+                .contains(&integer)
+                .then(|| serde_json::Value::from(integer))
+        })
+    } else if matches!(
+        pg_type.as_str(),
+        "float4" | "float8" | "real" | "double precision"
+    ) {
+        value
+            .as_f64()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+    } else if matches!(pg_type.as_str(), "numeric" | "decimal") {
+        value
+            .as_number()
+            .map(|number| serde_json::Value::String(number.to_string()))
+    } else if matches!(pg_type.as_str(), "bool" | "boolean") {
+        value.as_bool().map(serde_json::Value::Bool)
+    } else if matches!(pg_type.as_str(), "json" | "jsonb") {
+        Some(value.clone())
+    } else if is_array_type(&pg_type) {
+        value.is_array().then(|| value.clone())
+    } else {
+        value
+            .as_str()
+            .map(|text| serde_json::Value::String(text.to_string()))
+    };
+
+    normalized.ok_or_else(|| {
+        invalid(&format!(
+            "a value compatible with PostgreSQL type \"{}\"",
+            key_column.pg_type
+        ))
+    })
+}
+
+fn normalize_graphql_id(value: &serde_json::Value, pg_type: &str) -> Option<serde_json::Value> {
+    if integer_bounds(pg_type).is_some() {
+        let integer = match value {
+            serde_json::Value::Number(number) => number.as_i64(),
+            serde_json::Value::String(text) => text.parse::<i64>().ok(),
+            _ => None,
+        }?;
+        let (min, max) = integer_bounds(pg_type)?;
+        return (min..=max)
+            .contains(&integer)
+            .then(|| serde_json::Value::from(integer));
+    }
+    if pg_type.eq_ignore_ascii_case("uuid") {
+        return normalize_uuid(value).map(serde_json::Value::String);
+    }
+    if is_text_type(pg_type) {
+        return match value {
+            serde_json::Value::String(s) => Some(serde_json::Value::String(s.clone())),
+            serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                Some(serde_json::Value::String(n.to_string()))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn integer_bounds(pg_type: &str) -> Option<(i64, i64)> {
+    match pg_type.trim().to_ascii_lowercase().as_str() {
+        "int2" | "smallint" => Some((i16::MIN.into(), i16::MAX.into())),
+        "int4" | "int" | "integer" => Some((i32::MIN.into(), i32::MAX.into())),
+        "int8" | "bigint" => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
+fn is_text_type(pg_type: &str) -> bool {
+    matches!(
+        pg_type.trim().to_ascii_lowercase().as_str(),
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "citext"
+    )
+}
+
+fn normalize_uuid(value: &serde_json::Value) -> Option<String> {
+    sqlx::types::Uuid::parse_str(value.as_str()?)
+        .ok()
+        .map(|uuid| uuid.to_string())
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Add the root fields for functions that answer with rows of a table.
@@ -9522,6 +9657,70 @@ mod tests {
     use indexmap::IndexMap;
     use postrust_core::schema_cache::{Column, Table};
     use std::collections::{HashMap, HashSet};
+
+    fn entity_key_column(pg_type: &str, explicit_id: bool) -> EntityKeyColumn {
+        EntityKeyColumn {
+            field_name: "id".to_string(),
+            column_name: "id".to_string(),
+            pg_type: pg_type.to_string(),
+            explicit_id,
+        }
+    }
+
+    #[test]
+    fn federation_integer_keys_reject_strings() {
+        let column = entity_key_column("int4", false);
+
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!(2)).unwrap(),
+            serde_json::json!(2)
+        );
+        let error = normalize_entity_key_value("users", &column, &serde_json::json!("2"))
+            .expect_err("a GraphQL Int cannot be a string");
+        assert_eq!(
+            error.message,
+            "entity representation for \"users\" has invalid key field \"id\": expected a value compatible with PostgreSQL type \"int4\", found a string"
+        );
+    }
+
+    #[test]
+    fn federation_integer_backed_ids_have_one_normal_form() {
+        let column = entity_key_column("int4", true);
+
+        let number = normalize_entity_key_value("users", &column, &serde_json::json!(2)).unwrap();
+        let string = normalize_entity_key_value("users", &column, &serde_json::json!("2")).unwrap();
+        assert_eq!(number, serde_json::json!(2));
+        assert_eq!(string, number);
+        assert!(normalize_entity_key_value("users", &column, &serde_json::json!("two")).is_err());
+    }
+
+    #[test]
+    fn federation_text_backed_ids_normalize_integer_input_to_text() {
+        let column = entity_key_column("text", true);
+
+        let number = normalize_entity_key_value("users", &column, &serde_json::json!(2)).unwrap();
+        let string = normalize_entity_key_value("users", &column, &serde_json::json!("2")).unwrap();
+        assert_eq!(number, serde_json::json!("2"));
+        assert_eq!(string, number);
+    }
+
+    #[test]
+    fn federation_uuid_backed_ids_are_validated_and_canonicalized() {
+        let column = entity_key_column("uuid", true);
+
+        assert_eq!(
+            normalize_entity_key_value(
+                "users",
+                &column,
+                &serde_json::json!("550E8400-E29B-41D4-A716-446655440000")
+            )
+            .unwrap(),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert!(
+            normalize_entity_key_value("users", &column, &serde_json::json!("not-a-uuid")).is_err()
+        );
+    }
 
     fn create_test_table(name: &str) -> Table {
         let mut columns = IndexMap::new();

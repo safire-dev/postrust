@@ -546,6 +546,12 @@ A shared table keeps its unprefixed object type, for example `users @key(...)`.
 Its root fields and helper types still use the prefix, for example
 `billing_users`, `billing_users_bool_exp` and `billing_users_aggregate`.
 
+Entity representations are checked against each key field's GraphQL type
+before a database query is run. A field exposed as `Int` requires a JSON
+integer. A field explicitly exposed as `ID` accepts GraphQL's string or integer
+spelling and normalizes either to its integer, text or UUID database type.
+Invalid keys are returned as clear GraphQL errors without querying the database.
+
 ### What each role may do
 
 The one entry that is not a name. A permission is not derived from anything, so
