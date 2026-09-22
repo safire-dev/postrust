@@ -5,6 +5,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const EXPECTED_BOOLEAN: &str = "one of: true, false, 1, 0, yes, no, on, off";
+
+/// An environment variable contains a value that cannot be used safely.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("invalid value for {variable}: {value:?}; expected {expected}")]
+pub struct ConfigError {
+    variable: &'static str,
+    value: String,
+    expected: &'static str,
+}
+
 /// Main application configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -262,21 +273,25 @@ fn warn_ignored(var: &str, value: &str, expected: &str) {
     tracing::warn!("Ignoring {}={:?}: expected {}", var, value, expected);
 }
 
-/// The truthy spellings accepted for a boolean environment variable.
-fn env_bool(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "true" | "1" | "yes" | "on"
-    )
-}
-
-/// Parse the explicit boolean values accepted by GraphQL federation configuration.
-fn parse_graphql_federation(value: &str) -> Option<bool> {
-    match value.trim() {
-        "true" => Some(true),
-        "false" => Some(false),
+/// Parse the explicit spellings accepted for boolean environment variables.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn env_bool(variable: &'static str, value: &str) -> Result<bool, ConfigError> {
+    parse_bool(value).ok_or_else(|| {
+        let error = ConfigError {
+            variable,
+            value: value.to_string(),
+            expected: EXPECTED_BOOLEAN,
+        };
+        tracing::warn!("{error}");
+        error
+    })
 }
 
 /// Validate a namespace before it becomes part of generated GraphQL names.
@@ -299,7 +314,18 @@ fn parse_graphql_type_prefix(value: &str) -> Result<Option<String>, &'static str
 
 impl AppConfig {
     /// Load configuration from environment variables.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a boolean environment variable has an unsupported value. Use
+    /// [`Self::try_from_env`] when the caller can propagate a startup error.
     pub fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Load configuration from environment variables, rejecting invalid
+    /// boolean values.
+    pub fn try_from_env() -> Result<Self, ConfigError> {
         let mut config = Self::default();
 
         if let Ok(uri) = std::env::var("PGRST_DB_URI") {
@@ -352,10 +378,10 @@ impl AppConfig {
         }
 
         if let Ok(v) = std::env::var("PGRST_DB_AGGREGATES_ENABLED") {
-            config.db_aggregates_enabled = env_bool(&v);
+            config.db_aggregates_enabled = env_bool("PGRST_DB_AGGREGATES_ENABLED", &v)?;
         }
         if let Ok(v) = std::env::var("PGRST_DB_PREPARED_STATEMENTS") {
-            config.db_prepared_statements = env_bool(&v);
+            config.db_prepared_statements = env_bool("PGRST_DB_PREPARED_STATEMENTS", &v)?;
         }
         if let Ok(v) = std::env::var("PGRST_DB_PRE_REQUEST") {
             if !v.trim().is_empty() {
@@ -368,7 +394,7 @@ impl AppConfig {
             }
         }
         if let Ok(v) = std::env::var("PGRST_DB_CHANNEL_ENABLED") {
-            config.db_channel_enabled = env_bool(&v);
+            config.db_channel_enabled = env_bool("PGRST_DB_CHANNEL_ENABLED", &v)?;
         }
 
         // `PGRST_DB_MAX_ROWS` mirrors PostgREST's `db-max-rows`. Accept both.
@@ -391,7 +417,7 @@ impl AppConfig {
         // a base64 secret was verified against its own text and a role claim
         // outside `role` was never found.
         if let Ok(v) = std::env::var("PGRST_JWT_SECRET_IS_BASE64") {
-            config.jwt_secret_is_base64 = env_bool(&v);
+            config.jwt_secret_is_base64 = env_bool("PGRST_JWT_SECRET_IS_BASE64", &v)?;
         }
         if let Ok(key) = std::env::var("PGRST_JWT_ROLE_CLAIM_KEY") {
             if !key.trim().is_empty() {
@@ -399,7 +425,7 @@ impl AppConfig {
             }
         }
         if let Ok(v) = std::env::var("PGRST_JWT_CACHE_ENABLED") {
-            config.jwt_cache_enabled = env_bool(&v);
+            config.jwt_cache_enabled = env_bool("PGRST_JWT_CACHE_ENABLED", &v)?;
         }
         // Zero is meaningful here -- it turns the cache off, as in PostgREST --
         // so unlike the other durations it is not rejected.
@@ -520,10 +546,7 @@ impl AppConfig {
         }
 
         if let Ok(value) = std::env::var("PGRST_GRAPHQL_FEDERATION") {
-            match parse_graphql_federation(&value) {
-                Some(enabled) => config.graphql_federation = enabled,
-                None => warn_ignored("PGRST_GRAPHQL_FEDERATION", &value, "one of: true, false"),
-            }
+            config.graphql_federation = env_bool("PGRST_GRAPHQL_FEDERATION", &value)?;
         }
         if let Ok(value) = std::env::var("PGRST_GRAPHQL_TYPE_PREFIX") {
             match parse_graphql_type_prefix(&value) {
@@ -545,11 +568,11 @@ impl AppConfig {
         // or a POSTRUST_-prefixed alias.
         for var in ["PGRST_COMPAT_MODE", "POSTRUST_COMPAT_MODE"] {
             if let Ok(v) = std::env::var(var) {
-                config.compat_mode = env_bool(&v);
+                config.compat_mode = env_bool(var, &v)?;
             }
         }
 
-        config
+        Ok(config)
     }
 
     /// Get the default schema (first in the list).
@@ -925,12 +948,15 @@ mod tests {
     }
 
     #[test]
-    fn env_bool_accepts_the_usual_spellings() {
+    fn parse_bool_accepts_only_the_supported_spellings() {
         for s in ["true", "TRUE", "1", "yes", "on", " On "] {
-            assert!(env_bool(s), "{s:?}");
+            assert_eq!(parse_bool(s), Some(true), "{s:?}");
         }
-        for s in ["false", "0", "no", "off", "", "maybe"] {
-            assert!(!env_bool(s), "{s:?}");
+        for s in ["false", "FALSE", "0", "no", "off", " Off "] {
+            assert_eq!(parse_bool(s), Some(false), "{s:?}");
+        }
+        for s in ["", "maybe", "enabled", "2"] {
+            assert_eq!(parse_bool(s), None, "{s:?}");
         }
     }
 
@@ -951,14 +977,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_graphql_federation_configuration_is_ignored() {
-        let config = with_env(&[
-            ("PGRST_GRAPHQL_FEDERATION", "sometimes"),
-            ("PGRST_GRAPHQL_TYPE_PREFIX", "not-valid"),
-        ]);
+    fn malformed_graphql_federation_configuration_is_rejected() {
+        let error = with_env_result(&[("PGRST_GRAPHQL_FEDERATION", "sometimes")])
+            .expect_err("an invalid boolean must reject the configuration");
 
-        assert!(!config.graphql_federation);
-        assert_eq!(config.graphql_type_prefix, None);
+        assert_eq!(
+            error.to_string(),
+            "invalid value for PGRST_GRAPHQL_FEDERATION: \"sometimes\"; expected one of: true, false, 1, 0, yes, no, on, off"
+        );
     }
 
     #[test]
@@ -973,11 +999,15 @@ mod tests {
 
     /// Set the given variables, load, then remove them again.
     fn with_env(vars: &[(&str, &str)]) -> AppConfig {
+        with_env_result(vars).expect("test configuration should be valid")
+    }
+
+    fn with_env_result(vars: &[(&str, &str)]) -> Result<AppConfig, ConfigError> {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in vars {
             std::env::set_var(k, v);
         }
-        let config = AppConfig::from_env();
+        let config = AppConfig::try_from_env();
         for (k, _) in vars {
             std::env::remove_var(k);
         }

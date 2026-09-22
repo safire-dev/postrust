@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = postrust_core::AppConfig::from_env();
+    let config = postrust_core::AppConfig::try_from_env()?;
 
     info!("Starting Postrust server");
     info!("Database: {}", mask_db_uri(&config.db_uri));

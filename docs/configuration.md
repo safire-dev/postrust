@@ -757,6 +757,11 @@ A rejected value and an unset one are different mistakes, and the operator can
 only fix the one they are told about. This is why the log subscriber is
 installed before the configuration is read.
 
+Boolean settings are stricter because treating a typo as `false` can silently
+reverse a default or disable a requested feature. They accept `true`, `1`,
+`yes`, and `on`, or `false`, `0`, `no`, and `off`, without regard to case. Any
+other value logs a warning and fails startup.
+
 **Anything that has to be right to start at all fails the start**, and says so
 on the way out: a database URI that will not parse, a database that cannot be
 reached, a port already bound, a socket path occupied by something that is not a
