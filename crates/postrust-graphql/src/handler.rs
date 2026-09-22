@@ -12,7 +12,8 @@ use crate::subscription::{
     generate_subscription_fields, NotifyBroker, SubscriptionField as SubField,
 };
 use async_graphql::dynamic::*;
-use async_graphql::Value;
+use async_graphql::parser::types::{FragmentDefinition, Selection, SelectionSet, TypeCondition};
+use async_graphql::{Name, Positioned, SelectionField, Value};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -2805,6 +2806,88 @@ struct EntityRepresentation {
     values: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Fields selected for one concrete member of the federation `_Entity` union.
+///
+/// `SelectionField::selection_set()` expands every fragment but does not apply
+/// its type condition. Keep a parallel applicability list while walking the
+/// raw selection tree, then use it to retain only the fields meant for this
+/// entity type.
+fn entity_field_applicability(
+    selection_set: &SelectionSet,
+    fragments: &HashMap<Name, Positioned<FragmentDefinition>>,
+    type_name: &str,
+) -> Vec<bool> {
+    fn condition_matches(condition: Option<&Positioned<TypeCondition>>, type_name: &str) -> bool {
+        condition.is_none_or(|condition| {
+            let condition = condition.node.on.node.as_str();
+            condition == type_name || condition == "_Entity"
+        })
+    }
+
+    fn collect(
+        selection_set: &SelectionSet,
+        fragments: &HashMap<Name, Positioned<FragmentDefinition>>,
+        type_name: &str,
+        parent_matches: bool,
+        applicability: &mut Vec<bool>,
+    ) {
+        for selection in &selection_set.items {
+            match &selection.node {
+                Selection::Field(_) => applicability.push(parent_matches),
+                Selection::FragmentSpread(spread) => {
+                    let Some(fragment) = fragments.get(&spread.node.fragment_name.node) else {
+                        continue;
+                    };
+                    collect(
+                        &fragment.node.selection_set.node,
+                        fragments,
+                        type_name,
+                        parent_matches
+                            && condition_matches(Some(&fragment.node.type_condition), type_name),
+                        applicability,
+                    );
+                }
+                Selection::InlineFragment(fragment) => collect(
+                    &fragment.node.selection_set.node,
+                    fragments,
+                    type_name,
+                    parent_matches
+                        && condition_matches(fragment.node.type_condition.as_ref(), type_name),
+                    applicability,
+                ),
+            }
+        }
+    }
+
+    let mut applicability = Vec::new();
+    collect(
+        selection_set,
+        fragments,
+        type_name,
+        true,
+        &mut applicability,
+    );
+    applicability
+}
+
+fn entity_selection_fields<'ctx, 'a>(
+    ctx: &'ctx ResolverContext<'a>,
+    type_name: &str,
+) -> Vec<SelectionField<'ctx>> {
+    let applicability = entity_field_applicability(
+        &ctx.ctx.item.node.selection_set.node,
+        &ctx.ctx.query_env.fragments,
+        type_name,
+    );
+    let fields: Vec<_> = ctx.field().selection_set().collect();
+    debug_assert_eq!(fields.len(), applicability.len());
+    fields
+        .into_iter()
+        .zip(applicability)
+        .filter_map(|(field, applies)| applies.then_some(field))
+        .collect()
+}
+
 async fn resolve_entities<'a>(
     ctx: &ResolverContext<'a>,
     state: &EntityResolverState,
@@ -2980,11 +3063,12 @@ async fn resolve_entity_group(
             &lookup.schema_name,
             &lookup.table_name,
         ));
+        let selected_fields = entity_selection_fields(ctx, &lookup.type_name);
         let mut param_idx = bound_values.len() + 1;
         let computed = match table {
             Some(table) => computed_projections(
                 table,
-                ctx.field(),
+                selected_fields.iter().copied(),
                 "src",
                 state.names.as_ref(),
                 cache,
@@ -2999,7 +3083,7 @@ async fn resolve_entity_group(
             state.relationships.as_ref(),
             &lookup.type_name,
             "src",
-            ctx.field(),
+            selected_fields,
             state.max_rows,
             &mut 0,
             &mut param_idx,
@@ -3727,7 +3811,7 @@ async fn aggregate_value(
             let computed = match table {
                 Some(table) => computed_projections(
                     table,
-                    nodes,
+                    nodes.selection_set(),
                     "src",
                     spec.names.as_ref(),
                     cache,
@@ -3742,7 +3826,7 @@ async fn aggregate_value(
                 spec.relationships.as_ref(),
                 &spec.type_name,
                 "src",
-                nodes,
+                nodes.selection_set(),
                 spec.max_rows,
                 &mut 0,
                 &mut param_idx,
@@ -4063,7 +4147,7 @@ async fn query_rows(
                         (
                             computed_projections(
                                 table,
-                                ctx.field(),
+                                ctx.field().selection_set(),
                                 "src",
                                 spec.names.as_ref(),
                                 cache,
@@ -4116,7 +4200,7 @@ async fn query_rows(
                     relationships,
                     type_name,
                     "src",
-                    ctx.field(),
+                    ctx.field().selection_set(),
                     max_rows,
                     &mut 0,
                     &mut param_idx,
@@ -5623,7 +5707,7 @@ async fn reread_returning(
         relationships,
         type_name,
         "src",
-        returning,
+        returning.selection_set(),
         max_rows,
         &mut alias_counter,
         &mut param_idx,
@@ -5632,7 +5716,7 @@ async fn reread_returning(
     )?;
     let computed = computed_projections(
         table,
-        returning,
+        returning.selection_set(),
         "src",
         names,
         cache,
@@ -6195,7 +6279,7 @@ async fn execute_delete(
             relationships,
             type_name,
             "src",
-            returning,
+            returning.selection_set(),
             max_rows,
             &mut alias_counter,
             &mut param_idx,
@@ -6205,7 +6289,7 @@ async fn execute_delete(
         let computed = match cache.get_table(&qi) {
             Some(table) => computed_projections(
                 table,
-                returning,
+                returning.selection_set(),
                 "src",
                 names,
                 cache,
@@ -8263,10 +8347,10 @@ async fn build_distinct_on(
 /// notation reads `upper_name(author.*)` and `author.upper_name` as the same
 /// call; the explicit form is written here because it says which function is
 /// being called.
-#[allow(clippy::too_many_arguments)] // the selection, its source, and the binding state
-fn computed_projections(
+#[allow(clippy::too_many_arguments)] // the fields, their source, and the binding state
+fn computed_projections<'a>(
     table: &postrust_core::schema_cache::Table,
-    selection: async_graphql::SelectionField<'_>,
+    fields: impl IntoIterator<Item = SelectionField<'a>>,
     row_reference: &str,
     names: &crate::names::NameOverrides,
     schema_cache: &SchemaCache,
@@ -8274,7 +8358,7 @@ fn computed_projections(
     values: &mut Vec<serde_json::Value>,
 ) -> Result<Vec<String>, async_graphql::Error> {
     let mut projections = Vec::new();
-    for field in selection.selection_set() {
+    for field in fields {
         let name = field.name();
         // A real column wins, and the projection already carries it -- under
         // this name, whether or not that is the column's own.
@@ -8550,7 +8634,7 @@ fn nested_aggregate_select(
                     relationships,
                     target_type,
                     child_alias,
-                    child,
+                    child.selection_set(),
                     max_rows,
                     alias_counter,
                     param_idx,
@@ -8999,13 +9083,13 @@ fn embed_narrowing(
 }
 
 #[allow(clippy::too_many_arguments)] // one parameter per SQL clause, plus the binding state
-fn build_embed_expressions(
+fn build_embed_expressions<'a>(
     caller: &crate::role::Caller<'_>,
     schema_cache: &SchemaCache,
     relationships: &HashMap<String, Vec<RelationshipField>>,
     type_name: &str,
     parent_alias: &str,
-    selection: async_graphql::SelectionField<'_>,
+    fields: impl IntoIterator<Item = SelectionField<'a>>,
     max_rows: Option<i64>,
     alias_counter: &mut usize,
     param_idx: &mut usize,
@@ -9018,7 +9102,7 @@ fn build_embed_expressions(
 
     let mut expressions = Vec::new();
 
-    for field in selection.selection_set() {
+    for field in fields {
         // `<relationship>_aggregate` is the same embed with an aggregate
         // select list, so it is resolved here rather than by a resolver of its
         // own -- the correlation is what makes it a per-parent answer.
@@ -9119,7 +9203,7 @@ fn build_embed_expressions(
             relationships,
             &rel.target_type,
             &child_alias,
-            field,
+            field.selection_set(),
             max_rows,
             alias_counter,
             param_idx,
@@ -10062,6 +10146,47 @@ mod tests {
         assert!(!sdl.contains("_Service"), "service type:\n{sdl}");
         assert!(!sdl.contains("_service"), "service field:\n{sdl}");
         assert!(!sdl.contains("@key"), "federation key:\n{sdl}");
+    }
+
+    #[test]
+    fn federation_entity_selections_respect_fragment_type_conditions() {
+        let document = async_graphql::parser::parse_query(
+            r#"
+            query {
+              _entities(representations: []) {
+                __typename
+                ... on authors { id items { title } }
+                ...ShopFields
+                ... { common }
+                ...EntityName
+              }
+            }
+            fragment ShopFields on shops { id items { sku } }
+            fragment EntityName on _Entity { __typename }
+            "#,
+        )
+        .expect("query parses");
+        let (_, operation) = document.operations.iter().next().expect("one operation");
+        let entity = operation
+            .node
+            .selection_set
+            .node
+            .items
+            .iter()
+            .find_map(|selection| match &selection.node {
+                Selection::Field(field) if field.node.name.node == "_entities" => Some(&field.node),
+                _ => None,
+            })
+            .expect("_entities field");
+
+        assert_eq!(
+            entity_field_applicability(&entity.selection_set.node, &document.fragments, "authors"),
+            vec![true, true, true, false, false, true, true]
+        );
+        assert_eq!(
+            entity_field_applicability(&entity.selection_set.node, &document.fragments, "shops"),
+            vec![true, false, false, true, true, true, true]
+        );
     }
 
     #[test]

@@ -151,6 +151,41 @@ async fn create_composite_key_schema(pool: &PgPool, schema: &str) {
     .expect("create composite key fixture failed");
 }
 
+async fn create_mixed_entity_schema(pool: &PgPool, schema: &str) {
+    pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
+        .await
+        .expect("drop schema failed");
+    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+        .await
+        .expect("create schema failed");
+
+    for statement in [
+        format!("CREATE TABLE {schema}.authors (id SERIAL PRIMARY KEY, name TEXT NOT NULL)"),
+        format!(
+            "CREATE TABLE {schema}.author_items (id SERIAL PRIMARY KEY, title TEXT NOT NULL, \
+             author_id INTEGER NOT NULL REFERENCES {schema}.authors(id))"
+        ),
+        format!("CREATE TABLE {schema}.shops (id SERIAL PRIMARY KEY, code TEXT NOT NULL)"),
+        format!(
+            "CREATE TABLE {schema}.shop_items (id SERIAL PRIMARY KEY, sku TEXT NOT NULL, \
+             shop_id INTEGER NOT NULL REFERENCES {schema}.shops(id))"
+        ),
+        format!(
+            "CREATE FUNCTION {schema}.code(author_row {schema}.authors, prefix TEXT) \
+             RETURNS TEXT LANGUAGE SQL STABLE AS \
+             'SELECT prefix || author_row.name'"
+        ),
+        format!("INSERT INTO {schema}.authors (name) VALUES ('ada')"),
+        format!("INSERT INTO {schema}.author_items (title, author_id) VALUES ('paper', 1)"),
+        format!("INSERT INTO {schema}.shops (code) VALUES ('shop-code')"),
+        format!("INSERT INTO {schema}.shop_items (sku, shop_id) VALUES ('sku-1', 1)"),
+    ] {
+        pool.execute(statement.as_str())
+            .await
+            .expect("create mixed entity fixture failed");
+    }
+}
+
 async fn drop_schema(pool: &PgPool, schema: &str) {
     let _ = pool
         .execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
@@ -210,6 +245,21 @@ async fn build_federated_state_with_names(
 
 fn shared_table_names(schema: &str, table: &str) -> String {
     format!(r#"{{"tables": {{"{schema}.{table}": {{"federation": {{"shared": true}}}}}}}}"#)
+}
+
+fn mixed_entity_names(schema: &str) -> String {
+    format!(
+        r#"{{"tables": {{
+            "{schema}.authors": {{
+                "federation": {{"shared": true}},
+                "relationships": {{"author_items_author_id_fkey": "items"}}
+            }},
+            "{schema}.shops": {{
+                "federation": {{"shared": true}},
+                "relationships": {{"shop_items_shop_id_fkey": "items"}}
+            }}
+        }}}}"#
+    )
 }
 
 /// Execute a GraphQL document and return the whole response.
@@ -904,6 +954,80 @@ async fn federation_entities_can_select_computed_fields() {
         row.get("widget_label").and_then(|value| value.as_str()),
         Some("alpha:books")
     );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entity_relationships_respect_fragment_type_conditions() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedrelfragments");
+    create_mixed_entity_schema(&pool, &schema).await;
+
+    let names = mixed_entity_names(&schema);
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "authors", id: 1},
+            {__typename: "shops", id: 1}
+          ]) {
+            ... on authors {
+              id
+              items { title }
+            }
+            ... on shops {
+              id
+              items { sku }
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data["_entities"].as_array().expect("entities list");
+    assert_eq!(rows[0]["items"][0]["title"], "paper");
+    assert_eq!(rows[1]["items"][0]["sku"], "sku-1");
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entity_computed_fields_respect_fragment_type_conditions() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedcomputedfragments");
+    create_mixed_entity_schema(&pool, &schema).await;
+
+    let names = mixed_entity_names(&schema);
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "authors", id: 1},
+            {__typename: "shops", id: 1}
+          ]) {
+            ... on authors { id }
+            ... on shops { id code }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data["_entities"].as_array().expect("entities list");
+    assert_eq!(rows[0]["id"], 1);
+    assert_eq!(rows[1]["code"], "shop-code");
 
     drop_schema(&pool, &schema).await;
 }
