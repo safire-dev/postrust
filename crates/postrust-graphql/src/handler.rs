@@ -12,8 +12,11 @@ use crate::subscription::{
     generate_subscription_fields, NotifyBroker, SubscriptionField as SubField,
 };
 use async_graphql::dynamic::*;
+use async_graphql::extensions::{
+    Extension, ExtensionContext, ExtensionFactory, NextResolve, ResolveInfo,
+};
 use async_graphql::parser::types::{FragmentDefinition, Selection, SelectionSet, TypeCondition};
-use async_graphql::{Name, Positioned, SelectionField, Value};
+use async_graphql::{Name, Positioned, SelectionField, ServerResult, Value};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -72,6 +75,41 @@ pub struct GraphQLState {
     pub subscription_fields: Vec<SubField>,
     /// Notification broker for subscriptions
     pub broker: Arc<RwLock<Option<NotifyBroker>>>,
+}
+
+/// async-graphql's dynamic resolver requires every union value to carry a
+/// concrete type, including `null`. A typed null is then treated as an object,
+/// though, so its non-null fields fail. Convert only the library's error for a
+/// bare null `_Entity` list member back into the nullable member the schema
+/// declares.
+struct NullableFederationEntity;
+
+impl ExtensionFactory for NullableFederationEntity {
+    fn create(&self) -> Arc<dyn Extension> {
+        Arc::new(Self)
+    }
+}
+
+#[async_graphql::async_trait::async_trait]
+impl Extension for NullableFederationEntity {
+    async fn resolve(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        info: ResolveInfo<'_>,
+        next: NextResolve<'_>,
+    ) -> ServerResult<Option<Value>> {
+        let is_entity_member = info.parent_type == "[_Entity]" && info.return_type == "_Entity";
+        match next.run(ctx, info).await {
+            Err(error)
+                if is_entity_member
+                    && error.message
+                        == "internal: invalid value for union \"_Entity\", expected \"FieldValue::WithType\"" =>
+            {
+                Ok(Some(Value::Null))
+            }
+            result => result,
+        }
+    }
 }
 
 /// Build one schema for each role the permission document names.
@@ -685,7 +723,9 @@ fn build_dynamic_schema(
         subscription.as_ref().map(|_| subscription_root),
     );
     if generated.enable_federation {
-        builder = builder.enable_federation();
+        builder = builder
+            .enable_federation()
+            .extension(NullableFederationEntity);
         let entity_state = Arc::new(EntityResolverState::new(
             generated,
             Arc::clone(&relationships),
@@ -2936,7 +2976,7 @@ async fn resolve_entities<'a>(
             resolved[representation.index] = Some(match rows.get(&key) {
                 Some(row) => FieldValue::value(json_to_value(row.clone()))
                     .with_type(representation.type_name),
-                None => FieldValue::value(Value::Null),
+                None => FieldValue::NULL,
             });
         }
     }
@@ -10182,6 +10222,44 @@ mod tests {
         assert_eq!(
             entity_field_applicability(&entity.selection_set.node, &document.fragments, "shops"),
             vec![true, false, false, true, true, true, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_entity_lists_allow_null_members() {
+        let entity =
+            Object::new("widgets").field(Field::new("id", TypeRef::named_nn(TypeRef::INT), |_| {
+                FieldFuture::new(async { Ok(Some(Value::from(2))) })
+            }));
+        let union = Union::new("_Entity").possible_type("widgets");
+        let query = Object::new("Query").field(Field::new(
+            "_entities",
+            TypeRef::named_list_nn("_Entity"),
+            |_| {
+                FieldFuture::new(async {
+                    Ok(Some(FieldValue::list([
+                        FieldValue::NULL,
+                        FieldValue::NULL.with_type("widgets"),
+                    ])))
+                })
+            },
+        ));
+        let schema = Schema::build("Query", None, None)
+            .extension(NullableFederationEntity)
+            .register(entity)
+            .register(union)
+            .register(query)
+            .finish()
+            .expect("schema builds");
+
+        let response = schema
+            .execute("{ _entities { ... on widgets { id } } }")
+            .await;
+
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data,
+            async_graphql::value!({ "_entities": [null, { "id": 2 }] })
         );
     }
 
