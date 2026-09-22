@@ -2933,15 +2933,11 @@ async fn resolve_entities<'a>(
                 &lookup.key_columns,
                 &lookup.type_name,
             )?;
-            let row = rows.get(&key).ok_or_else(|| {
-                async_graphql::Error::new(format!(
-                    "entity \"{}\" could not be resolved from its key",
-                    representation.type_name
-                ))
-            })?;
-            resolved[representation.index] = Some(
-                FieldValue::value(json_to_value(row.clone())).with_type(representation.type_name),
-            );
+            resolved[representation.index] = Some(match rows.get(&key) {
+                Some(row) => FieldValue::value(json_to_value(row.clone()))
+                    .with_type(representation.type_name),
+                None => FieldValue::value(Value::Null),
+            });
         }
     }
 

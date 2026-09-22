@@ -597,14 +597,14 @@ async fn federation_integer_backed_ids_reuse_prepared_statements_across_both_inp
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
-async fn federation_entities_reject_missing_rows() {
+async fn federation_entities_return_null_for_missing_rows() {
     let pool = connect().await;
     let schema = unique_schema_name("fedmissing");
     create_widgets_schema(&pool, &schema).await;
 
     let names = shared_table_names(&schema, "widgets");
     let state = build_federated_state_with_names(&pool, &schema, &names).await;
-    let errors = execute_err(
+    let data = execute_ok(
         &state,
         &pool,
         &schema,
@@ -625,10 +625,16 @@ async fn federation_entities_reject_missing_rows() {
     )
     .await;
 
-    assert!(
-        errors.contains("entity \"widgets\" could not be resolved from its key"),
-        "unexpected error: {}",
-        errors
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entity results");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].is_null());
+    assert_eq!(rows[1].get("id").and_then(|value| value.as_i64()), Some(2));
+    assert_eq!(
+        rows[1].get("name").and_then(|value| value.as_str()),
+        Some("bravo")
     );
 
     drop_schema(&pool, &schema).await;
@@ -831,7 +837,7 @@ async fn federation_entities_do_not_bypass_select_permissions() {
         }}}}}}"#
     );
     let state = build_federated_state_with_names(&pool, &schema, &names).await;
-    let errors = execute_as_err(
+    let data = execute_as(
         &state,
         &pool,
         &schema,
@@ -852,10 +858,16 @@ async fn federation_entities_do_not_bypass_select_permissions() {
     )
     .await;
 
-    assert!(
-        errors.contains("entity \"widgets\" could not be resolved from its key"),
-        "unexpected error: {}",
-        errors
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entity results");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].is_null());
+    assert_eq!(rows[1].get("id").and_then(|value| value.as_i64()), Some(3));
+    assert_eq!(
+        rows[1].get("name").and_then(|value| value.as_str()),
+        Some("charlie")
     );
 
     drop_schema(&pool, &schema).await;
